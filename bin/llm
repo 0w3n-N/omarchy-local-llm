@@ -1,0 +1,678 @@
+#!/usr/bin/env -S python3 -I
+"""llm — pull GGUF models from Hugging Face and serve them with llama.cpp.
+
+One llama-server runs in router mode (systemd user unit `local-llm`) on
+127.0.0.1:8080. It serves every model in ~/.cache/llmfit/models (shared with
+llmfit's TUI `d` downloads), loads a model on the first request that names it,
+keeps one in VRAM at a time, and sleeps idle models (see presets.ini).
+
+`llm setup` installs the systemd user units; `llm uninstall` removes them.
+Part of https://github.com/0w3n-N/omarchy-local-llm (MIT).
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+MODELS = Path(os.environ.get("LLM_MODELS_DIR", Path.home() / ".cache/llmfit/models"))
+STAGING = MODELS.parent / ".llm-staging"
+PRESETS = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "local-llm/presets.ini"
+SERVER = os.environ.get("LLM_SERVER", "http://127.0.0.1:8080")
+UNIT = "local-llm.service"  # not llama-server.service: Arch's llama-cpp package ships a unit by that name
+RELOAD_PATH_UNIT = "local-llm-reload.path"
+UNIT_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd/user"
+BIN_LINK = Path.home() / ".local/bin/llm"
+SELF = Path(__file__).resolve()
+CTX_HEADROOM_GB = 2.5  # VRAM kept free for KV cache + compute buffers
+
+QUANT_RE = re.compile(
+    r"(?:UD-)?(?:I?Q\d(?:_[A-Z0-9]+)*|BF16|F16|F32|MXFP4(?:_MOE)?|TQ\d_\d)", re.I
+)
+SPLIT_RE = re.compile(r"-\d{5}-of-\d{5}$")
+FULL_PRECISION = {"F32", "F16", "BF16"}
+
+
+def die(msg, code=1):
+    print(f"llm: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def gb(n):
+    return f"{n / 2**30:.1f} GB"
+
+
+# ---------------------------------------------------------------- server API
+def api(path, data=None, timeout=10):
+    req = urllib.request.Request(SERVER + path)
+    if data is not None:
+        req.data = json.dumps(data).encode()
+        req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = r.read()
+    return json.loads(body) if body else {}
+
+
+def server_models(reload=True):
+    """Model list from the router, or None if it isn't running."""
+    try:
+        return api("/models?reload=1" if reload else "/models")["data"]
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def reload_server():
+    server_models(reload=True)
+
+
+# ---------------------------------------------------------------- hardware
+def vram_gb():
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        return sum(int(x) for x in out.split()) / 1024  # GiB
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return 0.0
+
+
+def ram_gb():
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        if line.startswith("MemTotal:"):
+            return int(line.split()[1]) / 1024**2  # GiB
+    return 0.0
+
+
+# ---------------------------------------------------------------- HF repo
+def hf_api():
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        die("huggingface_hub missing: sudo pacman -S python-huggingface-hub python-hf-xet")
+    return HfApi()
+
+
+def quant_of(filename):
+    stem = SPLIT_RE.sub("", Path(filename).name[: -len(".gguf")])
+    hits = QUANT_RE.findall(stem)
+    return hits[-1].upper() if hits else stem
+
+
+def repo_quants(repo):
+    """{quant: {"files": [...], "size": bytes}}, plus the preferred mmproj file."""
+    try:
+        info = hf_api().model_info(repo, files_metadata=True)
+    except Exception as e:  # RepositoryNotFound, GatedRepo, network...
+        die(f"can't read {repo}: {e.__class__.__name__}: {str(e).splitlines()[0]}")
+    quants, mmprojs = {}, []
+    for s in info.siblings:
+        name = s.rfilename
+        if not name.lower().endswith(".gguf"):
+            continue
+        if Path(name).name.lower().startswith("mmproj"):
+            mmprojs.append((name, s.size or 0))
+            continue
+        q = quants.setdefault(quant_of(name), {"files": [], "size": 0})
+        q["files"].append(name)
+        q["size"] += s.size or 0
+    mmproj = None
+    for pref in (r"(?<![A-Z])F16", r"BF16", r"Q8_0", r""):
+        match = [m for m in mmprojs if re.search(pref, Path(m[0]).name.upper())]
+        if match:
+            mmproj = match[0]
+            break
+    return quants, mmproj
+
+
+def fit_label(size, vram, ram):
+    size_gib = size / 2**30
+    if vram <= 0:  # no NVIDIA GPU detected: size against system RAM
+        return "CPU" if size_gib <= ram * 0.5 else "too big"
+    if size_gib <= vram - CTX_HEADROOM_GB:
+        return "GPU"
+    if size_gib <= vram + ram * 0.6:
+        return "GPU+CPU"
+    return "too big"
+
+
+def ranked(quants, mmproj, vram, ram):
+    """Rows (quant, total_size, fit), recommended first then by size desc."""
+    extra = mmproj[1] if mmproj else 0
+    rows = [(q, v["size"] + extra, fit_label(v["size"] + extra, vram, ram)) for q, v in quants.items()]
+    rows.sort(key=lambda r: -r[1])
+    gpu = [r for r in rows if r[2] in ("GPU", "CPU") and r[0] not in FULL_PRECISION]
+    rec = gpu[0][0] if gpu else None
+    if rec:
+        rows.sort(key=lambda r: r[0] != rec)
+    return rows, rec
+
+
+def model_name(repo, quant):
+    base = re.sub(r"[-_.]?gguf$", "", repo.split("/")[-1], flags=re.I)
+    return f"{base}-{quant}"
+
+
+# ---------------------------------------------------------------- local store
+def local_models():
+    """{name: path} for everything the router would see in MODELS."""
+    out = {}
+    if not MODELS.is_dir():
+        return out
+    for p in sorted(MODELS.iterdir()):
+        if p.name.startswith("."):
+            continue
+        if p.is_file() and p.suffix == ".gguf":
+            out[p.stem] = p
+        elif p.is_dir() and any(p.glob("*.gguf")):
+            out[p.name] = p
+    return out
+
+
+def disk_size(p):
+    if p.is_file():
+        return p.stat().st_size
+    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+
+
+def resolve_local(name):
+    models = local_models()
+    if name in models:
+        return name, models[name]
+    hits = [n for n in models if name.lower() in n.lower()]
+    if len(hits) == 1:
+        return hits[0], models[hits[0]]
+    if hits:
+        die(f"'{name}' is ambiguous: " + ", ".join(hits))
+    die(f"no local model matching '{name}' (see `llm ls`)")
+
+
+# ---------------------------------------------------------------- commands
+def cmd_search(args):
+    if not args:
+        die("usage: llm search <query> [-n N]")
+    limit = 20
+    if "-n" in args:
+        i = args.index("-n")
+        limit = int(args[i + 1])
+        del args[i : i + 2]
+    ms = hf_api().list_models(
+        search=" ".join(args), filter="gguf", sort="downloads", limit=limit,
+        expand=["downloads", "likes", "lastModified"],
+    )
+    rows = [(m.id, m.downloads or 0, m.likes or 0, str(m.last_modified or "")[:10]) for m in ms]
+    if not rows:
+        print("no GGUF repos found")
+        return
+    w = max(len(r[0]) for r in rows)
+    print(f"{'REPO':<{w}}  {'DOWNLOADS':>10}  {'LIKES':>6}  UPDATED")
+    for r in rows:
+        print(f"{r[0]:<{w}}  {r[1]:>10,}  {r[2]:>6}  {r[3]}")
+    print("\nNext: llm quants <repo>   or   llm pull <repo>")
+
+
+def print_quants(repo, rows, rec, mmproj, vram):
+    if vram > 0:
+        print(f"{repo}  (VRAM {vram:.0f} GB; 'GPU' = fits fully with ~{CTX_HEADROOM_GB:g} GB left for context)")
+    else:
+        print(f"{repo}  (no NVIDIA GPU detected; 'CPU' = fits in half of system RAM)")
+    if mmproj:
+        print(f"vision projector: {mmproj[0]} ({gb(mmproj[1])}, included in sizes)")
+    for q, size, fit in rows:
+        print(f"  {q:<14} {gb(size):>9}  {fit:<8}{'  <- recommended' if q == rec else ''}")
+
+
+def cmd_quants(args):
+    if len(args) != 1:
+        die("usage: llm quants <user/repo>")
+    repo = args[0].split(":")[0]
+    quants, mmproj = repo_quants(repo)
+    if not quants:
+        die(f"{repo} has no GGUF files")
+    vram = vram_gb()
+    rows, rec = ranked(quants, mmproj, vram, ram_gb())
+    print_quants(repo, rows, rec, mmproj, vram)
+
+
+def pick_quant(repo, quants, mmproj):
+    vram, ram = vram_gb(), ram_gb()
+    rows, rec = ranked(quants, mmproj, vram, ram)
+    if len(rows) == 1:
+        return rows[0][0]
+    if not (sys.stdin.isatty() and sys.stdout.isatty() and shutil.which("fzf")):
+        if not rec:
+            print_quants(repo, rows, rec, mmproj, vram)
+            die("nothing fits fully in memory; pick one explicitly: llm pull <repo>:<QUANT>")
+        print(f"auto-selected {rec}")
+        return rec
+    lines = [f"{q:<14} {gb(s):>9}  {fit:<8}{'  <- recommended' if q == rec else ''}" for q, s, fit in rows]
+    header = f"{repo} — " + (f"VRAM {vram:.0f} GB" if vram > 0 else f"RAM {ram:.0f} GB (no GPU)") + (f" — +{mmproj[0]}" if mmproj else "")
+    res = subprocess.run(
+        ["fzf", "--height=~60%", "--reverse", "--no-sort", f"--header={header}", "--prompt=quant> "],
+        input="\n".join(lines), capture_output=False, stdout=subprocess.PIPE, text=True,
+    )
+    if res.returncode != 0 or not res.stdout.strip():
+        die("cancelled", 130)
+    return res.stdout.split()[0]
+
+
+def interactive_repo():
+    """Search prompt -> fzf over matching GGUF repos -> chosen repo id."""
+    if shutil.which("gum"):
+        res = subprocess.run(["gum", "input", "--placeholder", "Search Hugging Face GGUF models (e.g. qwen3 coder)",
+                              "--width", "70"], stdout=subprocess.PIPE, text=True)
+        query = res.stdout.strip()
+    else:
+        query = input("Search Hugging Face GGUF models: ").strip()
+    if not query:
+        die("cancelled", 130)
+    print(f"searching for '{query}'…")
+    ms = list(hf_api().list_models(search=query, filter="gguf", sort="downloads", limit=40,
+                                   expand=["downloads", "likes", "lastModified"]))
+    if not ms:
+        die(f"no GGUF repos match '{query}'")
+    w = max(len(m.id) for m in ms)
+    lines = [f"{m.id:<{w}}  {m.downloads or 0:>10,} dl  {m.likes or 0:>5} ♥  {str(m.last_modified or '')[:10]}" for m in ms]
+    res = subprocess.run(["fzf", "--height=~70%", "--reverse", "--no-sort", "--prompt=repo> ",
+                          f"--header=Results for '{query}' (by downloads)"],
+                         input="\n".join(lines), stdout=subprocess.PIPE, text=True)
+    if res.returncode != 0 or not res.stdout.strip():
+        die("cancelled", 130)
+    return res.stdout.split()[0]
+
+
+def cmd_pull(args):
+    name_override = None
+    if "--name" in args:
+        i = args.index("--name")
+        name_override = args[i + 1]
+        del args[i : i + 2]
+    no_mmproj = "--no-mmproj" in args
+    args = [a for a in args if a != "--no-mmproj"]
+    if not args and sys.stdin.isatty() and shutil.which("fzf"):
+        args = [interactive_repo()]
+    if len(args) != 1:
+        die("usage: llm pull <user/repo>[:QUANT] [--name NAME] [--no-mmproj]")
+    spec = args[0]
+    spec = re.sub(r"^(https?://)?(www\.)?huggingface\.co/", "", spec).strip("/")
+    repo, _, quant = spec.partition(":")
+    if repo.count("/") != 1:
+        die(f"'{repo}' isn't a user/repo id (try `llm search`)")
+
+    quants, mmproj = repo_quants(repo)
+    if not quants:
+        die(f"{repo} has no GGUF files")
+    if no_mmproj:
+        mmproj = None
+    if quant:
+        match = {q: v for q, v in quants.items() if q.upper() == quant.upper()}
+        if not match:
+            die(f"no {quant} in {repo}. Available: " + ", ".join(sorted(quants)))
+        quant = next(iter(match))
+    else:
+        quant = pick_quant(repo, quants, mmproj)
+
+    name = name_override or model_name(repo, quant)
+    dest = MODELS / name
+    if name in local_models():
+        print(f"already have {name}  ({local_models()[name]})")
+        return
+    files = quants[quant]["files"] + ([mmproj[0]] if mmproj else [])
+    total = quants[quant]["size"] + (mmproj[1] if mmproj else 0)
+    free = shutil.disk_usage(MODELS.parent if MODELS.parent.exists() else Path.home()).free
+    if total > free:
+        die(f"need {gb(total)}, only {gb(free)} free")
+
+    if not shutil.which("hf"):
+        die("the `hf` command is missing: sudo pacman -S python-huggingface-hub python-hf-xet")
+    print(f"pulling {repo} {quant} -> {name}  ({gb(total)}, {len(files)} file(s))")
+    stage = STAGING / name
+    stage.mkdir(parents=True, exist_ok=True)
+    rc = subprocess.run(["hf", "download", repo, *files, "--local-dir", str(stage)]).returncode
+    if rc != 0:
+        die(f"download failed (partial files kept in {stage}; re-run to resume)", rc)
+
+    # Flatten (some repos keep splits in a quant subfolder) and drop hf metadata.
+    for f in files:
+        src = stage / f
+        if src.parent != stage:
+            src.rename(stage / src.name)
+    shutil.rmtree(stage / ".cache", ignore_errors=True)
+    for d in sorted((p for p in stage.rglob("*") if p.is_dir()), reverse=True):
+        try:
+            d.rmdir()
+        except OSError:
+            pass
+    MODELS.mkdir(parents=True, exist_ok=True)
+    stage.rename(dest)  # atomic: the router never sees a half-downloaded model
+    try:
+        STAGING.rmdir()
+    except OSError:
+        pass
+
+    if server_models(reload=True) is None:
+        print(f"saved to {dest}\nserver isn't running — start it with: llm serve")
+    else:
+        print(f"ready: model \"{name}\" at {SERVER}/v1  (web UI: {SERVER})")
+
+
+def cmd_ls(args):
+    srv = server_models(reload=True)
+    local = local_models()
+    if srv is None:
+        print("(server not running — `llm serve`)")
+        rows = [(n, "-", disk_size(p), "") for n, p in local.items()]
+    else:
+        rows = []
+        for m in srv:
+            args_ = m["status"]["args"]
+            local_path = local.get(m["id"])
+            size = disk_size(local_path) if local_path else 0
+            vision = "vision" if "--mmproj" in args_ else ""
+            alias = ",".join(m.get("aliases") or [])
+            extra = " ".join(x for x in (vision, f"alias={alias}" if alias else "") if x)
+            rows.append((m["id"], m["status"]["value"], size, extra))
+    if not rows:
+        print(f"no models yet in {MODELS}\n  llm search <query>  ->  llm pull <user/repo>")
+        return
+    w = max(len(r[0]) for r in rows)
+    print(f"{'MODEL':<{w}}  {'STATUS':<9} {'SIZE':>9}  ")
+    for n, st, size, extra in rows:
+        print(f"{n:<{w}}  {st:<9} {gb(size):>9}  {extra}")
+
+
+def loaded_names():
+    srv = server_models(reload=False) or []
+    return [m["id"] for m in srv if m["status"]["value"] not in ("unloaded",)]
+
+
+def unload(name):
+    try:
+        api("/models/unload", {"model": name})
+        return True
+    except urllib.error.HTTPError as e:
+        print(f"unload {name}: HTTP {e.code} {e.read().decode(errors='replace')[:200]}", file=sys.stderr)
+    except (urllib.error.URLError, OSError):
+        pass
+    return False
+
+
+def cmd_unload(args):
+    targets = args or loaded_names()
+    if not targets:
+        print("nothing loaded")
+        return
+    import time
+    sent = [n for n in targets if unload(n)]
+    for _ in range(50):  # unload is async; wait so VRAM is actually free on return
+        if not set(sent) & set(loaded_names()):
+            break
+        time.sleep(0.2)
+    for n in sent:
+        print(f"unloaded {n}")
+
+
+def cmd_rm(args):
+    yes = "-y" in args
+    args = [a for a in args if a != "-y"]
+    if len(args) != 1:
+        die("usage: llm rm <model> [-y]")
+    name, path = resolve_local(args[0])
+    if not yes:
+        ans = input(f"delete {name} ({gb(disk_size(path))}) at {path}? [y/N] ")
+        if ans.strip().lower() not in ("y", "yes"):
+            die("aborted")
+    if name in loaded_names():
+        unload(name)
+    shutil.rmtree(path) if path.is_dir() else path.unlink()
+    reload_server()
+    print(f"removed {name}")
+
+
+def systemctl(*a):
+    return subprocess.run(["systemctl", "--user", *a]).returncode
+
+
+def cmd_serve(args):
+    if not (UNIT_DIR / UNIT).exists():
+        die(f"{UNIT} isn't installed yet — run: llm setup")
+    rc = systemctl("enable", "--now", UNIT, RELOAD_PATH_UNIT)
+    if rc == 0:
+        print(f"llama-server running at {SERVER} (OpenAI API: {SERVER}/v1) — starts at login")
+    sys.exit(rc)
+
+
+def cmd_stop(args):
+    sys.exit(systemctl("stop", UNIT))
+
+
+def cmd_restart(args):
+    sys.exit(systemctl("restart", UNIT))
+
+
+def cmd_status(args):
+    systemctl("--no-pager", "status", UNIT)
+    ln = loaded_names()
+    print("\nloaded:", ", ".join(ln) if ln else "none")
+
+
+def cmd_logs(args):
+    os.execvp("journalctl", ["journalctl", "--user", "-u", UNIT, "-f", "-n", "100", *args])
+
+
+def cmd_ui(args):
+    subprocess.Popen(["xdg-open", SERVER], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_edit(args):
+    if not PRESETS.exists():
+        die(f"{PRESETS} doesn't exist yet — run: llm setup")
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or next(
+        (e for e in ("nvim", "vim", "nano", "vi") if shutil.which(e)), None)
+    if not editor:
+        die(f"no editor found; set $EDITOR or edit {PRESETS} by hand")
+    subprocess.run([*editor.split(), str(PRESETS)])
+    reload_server()
+    print("presets reloaded (a loaded model picks up changes after `llm unload`)")
+
+
+def cmd_fit(args):
+    if not shutil.which("llmfit"):
+        die("llmfit isn't installed. It recommends models for your hardware: "
+            "https://github.com/AlexsJones/llmfit (Omarchy: sudo pacman -S llmfit)")
+    os.execvp("llmfit", ["llmfit", *args])
+
+
+# ---------------------------------------------------------------- setup
+UNIT_FILES = {
+    UNIT: """\
+[Unit]
+Description=Local LLM: llama.cpp server in router mode (models from ~/.cache/llmfit/models)
+After=network.target
+
+[Service]
+ExecStart={llama_server} --host 127.0.0.1 --port 8080 \\
+  --models-dir %h/.cache/llmfit/models \\
+  --models-preset %E/local-llm/presets.ini \\
+  --models-max 1
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+""",
+    "local-llm-reload.service": """\
+[Unit]
+Description=Rescan the local-llm models dir and presets
+
+[Service]
+Type=oneshot
+ExecStart=-{curl} -sf -o /dev/null --max-time 10 "http://127.0.0.1:8080/models?reload=1"
+""",
+    RELOAD_PATH_UNIT: """\
+[Unit]
+Description=Reload local-llm when models or presets change (e.g. llmfit downloads)
+
+[Path]
+PathChanged=%h/.cache/llmfit/models
+PathChanged=%E/local-llm/presets.ini
+
+[Install]
+WantedBy=default.target
+""",
+}
+
+PRESETS_TEMPLATE = """\
+; llama-server router presets — applied on top of the models in ~/.cache/llmfit/models.
+; Keys are llama-server long flags without the leading "--".
+; Saving this file triggers an automatic reload (local-llm-reload.path);
+; a model that's already loaded picks up changes the next time it loads (`llm unload`).
+
+[*]
+; Applies to every model.
+; Free weights from VRAM after 10 min idle (~250 MB stays reserved while asleep).
+sleep-idle-seconds = 600
+; Without a cap every model allocates its full trained context (e.g. 262k) and
+; fills VRAM with KV cache. Raise per model below when you need longer context.
+ctx-size = 32768
+; gpu-layers is left unset so --fit (on by default) offloads what doesn't fit.
+
+; Per-model overrides — section name = model name from `llm ls`:
+; [Qwen3-VL-8B-Instruct-Q8_K_XL]
+; alias = qwen-vl
+; ctx-size = 65536
+; temp = 0.7
+"""
+
+
+def confirm(question):
+    if not sys.stdin.isatty():
+        return False
+    return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+
+
+def write_if_wanted(path, content):
+    """Create path; never replace a different existing file without asking."""
+    if path.exists():
+        if path.read_text() == content:
+            print(f"  ok       {path}")
+            return
+        if not confirm(f"  {path} exists and differs. Replace it?"):
+            print(f"  kept     {path}")
+            return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    print(f"  wrote    {path}")
+
+
+def cmd_setup(args):
+    """Install the systemd user units, a starter presets.ini and the `llm` link."""
+    llama_server = shutil.which("llama-server")
+    curl = shutil.which("curl")
+    missing = []
+    if not llama_server:
+        missing.append("llama-server   sudo pacman -S llama-cpp   (NVIDIA: add ggml-cuda, Vulkan: ggml-vulkan)")
+    if not curl:
+        missing.append("curl           sudo pacman -S curl")
+    if missing:
+        print("Missing required programs:\n  " + "\n  ".join(missing))
+        die("install them, then run setup again")
+    if not shutil.which("hf"):
+        print("note: `hf` not found — `llm pull` needs it: sudo pacman -S python-huggingface-hub python-hf-xet")
+
+    print("Setting up the llama.cpp router (user-level, no sudo):")
+    MODELS.mkdir(parents=True, exist_ok=True)
+    for name, body in UNIT_FILES.items():
+        write_if_wanted(UNIT_DIR / name, body.format(llama_server=llama_server, curl=curl))
+    if PRESETS.exists():
+        print(f"  kept     {PRESETS}")
+    else:
+        write_if_wanted(PRESETS, PRESETS_TEMPLATE)
+
+    if BIN_LINK.is_symlink() and BIN_LINK.resolve() == SELF:
+        print(f"  ok       {BIN_LINK}")
+    elif BIN_LINK.exists() or BIN_LINK.is_symlink():
+        print(f"  kept     {BIN_LINK} (something else is there; run this CLI as {SELF})")
+    else:
+        BIN_LINK.parent.mkdir(parents=True, exist_ok=True)
+        BIN_LINK.symlink_to(SELF)
+        print(f"  linked   {BIN_LINK} -> {SELF}")
+
+    systemctl("daemon-reload")
+    rc = systemctl("enable", "--now", UNIT, RELOAD_PATH_UNIT)
+    if rc != 0:
+        die(f"couldn't start {UNIT} — see: llm logs", rc)
+    print(f"\nllama-server is running at {SERVER} (OpenAI API: {SERVER}/v1) and starts at login.")
+    print("Next: llm pull   (search Hugging Face and download a model)")
+
+
+def cmd_uninstall(args):
+    """Remove what setup installed. Models and presets.ini are kept."""
+    if "-y" not in args and not confirm("Stop the local-llm service and remove its systemd units and the llm link?"):
+        die("aborted")
+    systemctl("disable", "--now", UNIT, RELOAD_PATH_UNIT)
+    for name in UNIT_FILES:
+        f = UNIT_DIR / name
+        if f.exists():
+            f.unlink()
+            print(f"  removed  {f}")
+    systemctl("daemon-reload")
+    if BIN_LINK.is_symlink() and BIN_LINK.resolve() == SELF:
+        BIN_LINK.unlink()
+        print(f"  removed  {BIN_LINK}")
+    print(f"\nKept your models ({MODELS}) and settings ({PRESETS}).")
+    print("Delete those two paths by hand if you want the disk space back.")
+
+
+HELP = f"""\
+llm — Hugging Face GGUF models served by llama.cpp (router at {SERVER})
+
+  llm search <query> [-n N]       find GGUF repos on Hugging Face
+  llm quants <user/repo>          list quants with size + VRAM fit
+  llm pull                        interactive: search -> pick repo -> pick quant
+  llm pull <user/repo>[:QUANT]    download (picker if no QUANT; adds vision mmproj)
+        [--name NAME] [--no-mmproj]
+  llm ls                          local models + loaded/unloaded status
+  llm rm <model> [-y]             delete a model
+  llm unload [model]              free VRAM now (default: all loaded)
+
+  llm serve | stop | restart | status | logs
+  llm fit                         open llmfit (model recommendations for your hardware)
+  llm setup                       install the local-llm systemd user service
+  llm uninstall [-y]              remove it again (keeps models and presets)
+  llm ui                          open the llama.cpp web UI
+  llm edit                        edit per-model presets ({PRESETS})
+
+Models live in {MODELS} — llmfit's TUI `d` (llama.cpp runtime)
+downloads there too and shows up automatically. Point any OpenAI client at
+{SERVER}/v1 with "model": "<name from llm ls>"; it loads on first use.
+"""
+
+COMMANDS = {
+    "search": cmd_search, "quants": cmd_quants, "pull": cmd_pull, "ls": cmd_ls,
+    "list": cmd_ls, "rm": cmd_rm, "unload": cmd_unload, "serve": cmd_serve,
+    "start": cmd_serve, "stop": cmd_stop, "restart": cmd_restart,
+    "status": cmd_status, "logs": cmd_logs, "ui": cmd_ui, "edit": cmd_edit,
+    "fit": cmd_fit, "setup": cmd_setup, "uninstall": cmd_uninstall,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(HELP)
+        return
+    cmd = COMMANDS.get(sys.argv[1])
+    if not cmd:
+        die(f"unknown command '{sys.argv[1]}' (llm --help)")
+    try:
+        cmd(sys.argv[2:])
+    except KeyboardInterrupt:
+        die("interrupted", 130)
+
+
+if __name__ == "__main__":
+    main()
