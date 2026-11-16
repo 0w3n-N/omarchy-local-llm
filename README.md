@@ -50,7 +50,7 @@ The service is named `local-llm` on purpose: Arch's `llama-cpp` package ships it
 
 ## Use
 
-Panel buttons, left to right: pull a model, open llmfit, open the web UI, edit presets, show server logs. Click a model to load or unload it. Keyboard: arrows and Enter, `s` server, `u` unload, `p` pull, `f` llmfit, `w` web UI, `e` presets, `l` logs, `r` refresh.
+Panel buttons, left to right: pull a model, open llmfit, open the web UI, edit presets, show server logs, open a sandbox shell. Click a model to load or unload it. Keyboard: arrows and Enter, `s` server, `u` unload, `p` pull, `f` llmfit, `w` web UI, `e` presets, `l` logs, `b` sandbox shell, `r` refresh.
 
 The same things from a terminal:
 
@@ -65,6 +65,30 @@ llm edit                          per-model settings
 ```
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1` and use a model name from `llm ls`. The server listens on localhost only.
+
+## Sandbox: let models run commands without touching your system
+
+Agent harnesses give models a bash tool. With a local model, you may not want that bash running as you, on your machine. `llm sandbox` gives you a Docker container for those commands, and you never have to use docker yourself:
+
+```
+llm sandbox setup                 one time: installs/enables docker, gives you access, builds the box
+llm sandbox shell                 a shell inside (also the panel's 󰆍 button / b key)
+llm sandbox with omp              start any harness with its shell swapped for the sandbox
+llm sandbox run <command>         run one command inside
+llm sandbox status | stop | reset | offline | online | install <pkg> | config | remove
+```
+
+For harnesses you start some other way, set their shell to `~/.local/bin/sandbox-bash`, either as `SHELL=` or in the harness's shell setting (`shellPath` in pi/oh-my-pi, `CLAUDE_CODE_SHELL` in Claude Code). It accepts the same arguments as bash (`-c`, `-l -c`, scripts, stdin), returns the same exit codes, and passes kills and timeouts through to the command inside.
+
+What the box can reach:
+
+- **Files:** only `~/Sandbox`, mounted at the same path inside, so a harness started there has a working directory that's valid on both sides. Files the model creates there belong to you. Nothing else in your home is visible: no keys, dotfiles, or browser profiles.
+- **Environment:** none of your environment variables (API keys in your shell stay out). Add specific ones with `llm sandbox config env NAME1,NAME2`.
+- **Privileges:** an unprivileged user that can't gain root (`no-new-privileges`, no capabilities, no sudo, no docker socket). It's capped at 8 GB RAM, half your CPUs up to 8, and 1024 processes, all changeable with `llm sandbox config`.
+- **Network:** internet on, so `pip`, `npm`, and `git clone` work. `llm sandbox offline` cuts it completely.
+- **Persistence:** the container and anything installed in it persist until `llm sandbox reset`. `llm sandbox install <debian-pkg>` adds system packages that survive resets.
+
+Only shell commands are sandboxed. A harness's own read, write, and edit tools still run on the host with your permissions, so start the harness inside `~/Sandbox` (`llm sandbox with` does this) and keep its file-access settings limited to that folder. Setup adds you to the `docker` group, which is root-equivalent for programs running as you on the host. The model can't use that from inside the box.
 
 ### Settings
 
@@ -81,13 +105,14 @@ Plugins run unsandboxed inside the Omarchy shell, so here is everything this one
 - `curl` to `127.0.0.1` only (model list, load, unload)
 - `systemctl --user` to start, stop, and inspect `local-llm.service`
 - `nvidia-smi` and `cat /proc/<pid>/stat` for the VRAM gauge and the "generating" state, only while a model is loaded
-- the bundled `bin/llm` in a terminal, when you press a button that needs it
+- the bundled `bin/llm` in a terminal, when you press a button that needs it (the sandbox button runs `llm sandbox shell`, which runs setup with `sudo` first if needed)
 
 It makes no network requests of its own. `llm search` and `llm pull` talk to huggingface.co when you run them.
 
 ## Remove
 
 ```sh
+llm sandbox remove            # deletes the sandbox container and image (keeps ~/Sandbox)
 llm uninstall                 # stops the service, removes the three units and the llm link
 omarchy plugin remove io.github.0w3n-n.local-llm
 ```
@@ -100,6 +125,8 @@ Run `llm uninstall` first, since it lives inside the plugin folder. It keeps you
 - **The service fails to start**: `llm logs`. The usual causes are a missing GPU backend package or another program on port 8080.
 - **A model is slow or only partly on the GPU**: it doesn't fit in VRAM alongside its context. Pick a smaller quantization (`llm quants <repo>`) or lower `ctx-size` for that model.
 - **A new download doesn't appear**: `llm ls` forces a rescan.
+- **Sandbox says "log out and back in"**: setup added you to the docker group but this login doesn't have it yet. Run `llm sandbox setup` again to bridge the session, or log out and back in.
+- **Something in the sandbox is broken**: `llm sandbox reset` gives you a fresh container. Your files in `~/Sandbox` are kept.
 
 ## License
 

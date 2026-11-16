@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.0w3n-n.local-llm",
   "name": "Local LLM",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "0w3n-N",
   "license": "MIT",
-  "description": "Run local LLMs with llama.cpp from the bar: see which model is in VRAM, load or unload models, pull GGUF models from Hugging Face, start or stop the server. The icon is a live attention-mask matrix with a VRAM gauge.",
+  "description": "Run local LLMs with llama.cpp from the bar: see which model is in VRAM, load or unload models, pull GGUF models from Hugging Face, start or stop the server, and give models a Docker sandbox for their shell commands. The icon is a live attention-mask matrix with a VRAM gauge.",
   "homepage": "https://github.com/0w3n-N/omarchy-local-llm",
   "repository": "https://github.com/0w3n-N/omarchy-local-llm",
   "keywords": [
@@ -17,7 +17,9 @@
     "local ai",
     "vram",
     "gpu",
-    "openai api"
+    "openai api",
+    "sandbox",
+    "docker"
   ],
   "kinds": [
     "bar-widget"

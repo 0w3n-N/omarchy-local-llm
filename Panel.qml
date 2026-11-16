@@ -93,7 +93,8 @@ Panel {
     { glyph: "󰍛", key: "action.llmfit", run: function() { llm.runCli("fit"); root.close() } },
     { glyph: "󰖟", key: "action.webui", run: function() { llm.openWebUi(); root.close() } },
     { glyph: "󰏫", key: "action.presets", run: function() { llm.runCli("edit"); root.close() } },
-    { glyph: "󰦪", key: "action.logs", run: function() { llm.runCli("logs"); root.close() } }
+    { glyph: "󰦪", key: "action.logs", run: function() { llm.runCli("logs"); root.close() } },
+    { glyph: "󰆍", key: "action.sandbox", run: function() { llm.runCli("sandbox shell"); root.close() } }
   ]
 
   Commons.Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
@@ -300,6 +301,7 @@ Panel {
         else if (k === "w") root.actions[2].run()
         else if (k === "e") root.actions[3].run()
         else if (k === "l") root.actions[4].run()
+        else if (k === "b") root.actions[5].run()
       }
 
       Flickable {

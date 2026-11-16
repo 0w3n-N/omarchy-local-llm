@@ -48,6 +48,7 @@
   "action.webui": "Open web UI (w)",
   "action.presets": "Edit model presets (e)",
   "action.logs": "Server logs (l)",
+  "action.sandbox": "Sandbox shell — where models run commands (b)",
   "keys.hint": "s server · u unload · r refresh · Enter load/unload",
   "hero.notSetUp": "Not set up yet",
   "server.setup": "Run setup",

@@ -185,7 +185,7 @@ Item {
   // Run a subcommand of the bundled CLI in a floating terminal. `sub` is
   // always one of the fixed words below, never external text.
   function runCli(sub) {
-    if (!/^(setup|pull|fit|edit|logs)$/.test(sub)) return
+    if (!/^(setup|pull|fit|edit|logs|sandbox shell)$/.test(sub)) return
     var quoted = "'" + cliPath.replace(/'/g, "'\\''") + "'"
     Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", quoted + " " + sub])
   }
