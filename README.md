@@ -66,6 +66,16 @@ llm edit                          per-model settings
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1` and use a model name from `llm ls`. The server listens on localhost only and refuses cross-origin requests from web pages (`--cors-origins localhost`), so a website open in your browser can't list, load, or unload your models. Apps that call the API directly, like agent harnesses or `curl`, aren't affected. llama.cpp enforces this from build b12340; older builds only hide the replies from the page, which could still send requests that load or unload a model. `llm setup` and `llm status` warn when your build is one of those.
 
+To close that gap on older builds, or if you just want authentication, require an API key:
+
+```
+llm setup --api-key       # generate a key and restart the server with it
+llm key                   # print it, to paste into your clients
+llm setup --no-api-key    # back to keyless
+```
+
+The key lives in `~/.config/local-llm/api-key` (readable only by you). The panel and the `llm` command use it automatically; give other clients the key along with `http://127.0.0.1:8080/v1`. With a key set, a web page can't load, unload, or query models on any llama.cpp version. `/health` stays open, as llama.cpp always allows it.
+
 ## Sandbox: let models run commands without touching your system
 
 Agent harnesses give models a bash tool. With a local model, you may not want that bash running as you, on your machine. `llm sandbox` gives you a Docker container for those commands, and you never have to use docker yourself:
@@ -102,7 +112,7 @@ The widget's own settings are the server port (default 8080) and how often it ch
 
 Plugins run unsandboxed inside the Omarchy shell, so here is everything this one executes:
 
-- `curl` to `127.0.0.1` only (model list, load, unload)
+- `curl` to `127.0.0.1` only (model list, load, unload); with an API key set, curl reads the header from `~/.config/local-llm/api-key.header` (`-H @file`), so the key never appears in a process list
 - `systemctl --user` to start, stop, and inspect `local-llm.service`
 - `nvidia-smi` and `cat /proc/<pid>/stat` for the VRAM gauge and the "generating" state, only while a model is loaded
 - the bundled `bin/llm` in a terminal, when you press a button that needs it (the sandbox button runs `llm sandbox shell`, which runs setup with `sudo` first if needed)

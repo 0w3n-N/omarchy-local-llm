@@ -16,6 +16,11 @@ Item {
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 5, 2, 300)
   readonly property string baseUrl: "http://127.0.0.1:" + port
   readonly property string unitName: "local-llm.service"
+  // Written by `llm setup --api-key`: one "Authorization: Bearer …" line,
+  // handed to curl as `-H @file` so the key never shows up in argv.
+  readonly property string authHeaderPath: (Quickshell.env("XDG_CONFIG_HOME") || Quickshell.env("HOME") + "/.config") + "/local-llm/api-key.header"
+  property bool authRequired: false
+  function authArgs() { return authRequired ? ["-H", "@" + authHeaderPath] : [] }
 
   property bool online: false
   property bool polled: false
@@ -109,8 +114,8 @@ Item {
   // local-llm-reload.path unit normally does that already).
   function refresh(rescan) {
     if (pollProcess.running) return
-    pollProcess.command = ["curl", "-sf", "--max-time", "3", "--max-filesize", "2000000",
-                           baseUrl + (rescan ? "/models?reload=1" : "/models")]
+    pollProcess.command = ["curl", "-sf", "--max-time", "3", "--max-filesize", "2000000"].concat(
+                           authArgs(), [baseUrl + (rescan ? "/models?reload=1" : "/models")])
     pollProcess.running = true
   }
 
@@ -133,8 +138,8 @@ Item {
   function post(path, modelId) {
     if (actionProcess.running) return
     actionProcess.command = ["curl", "-sf", "--max-time", "15", "-X", "POST",
-                             "-H", "Content-Type: application/json",
-                             "-d", JSON.stringify({ model: modelId }), baseUrl + path]
+                             "-H", "Content-Type: application/json"].concat(authArgs(), [
+                             "-d", JSON.stringify({ model: modelId }), baseUrl + path])
     actionProcess.running = true
   }
 
@@ -188,6 +193,16 @@ Item {
     if (!/^(setup|pull|fit|edit|logs|sandbox shell)$/.test(sub)) return
     var quoted = "'" + cliPath.replace(/'/g, "'\\''") + "'"
     Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", quoted + " " + sub])
+  }
+
+  FileView {
+    id: authHeaderView
+    path: root.authHeaderPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: { root.authRequired = text().indexOf("Authorization:") === 0; root.refresh(false) }
+    onLoadFailed: { root.authRequired = false; root.refresh(false) }
   }
 
   Timer {

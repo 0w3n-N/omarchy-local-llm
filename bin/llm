@@ -23,6 +23,13 @@ MODELS = Path(os.environ.get("LLM_MODELS_DIR", Path.home() / ".cache/llmfit/mode
 STAGING = MODELS.parent / ".llm-staging"
 PRESETS = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "local-llm/presets.ini"
 SERVER = os.environ.get("LLM_SERVER", "http://127.0.0.1:8080")
+# Optional API key (`llm setup --api-key`). llama-server reads KEY_FILE through
+# LLAMA_ARG_API_KEY_FILE in ENV_FILE; curl clients (panel, reload unit) send
+# HEADER_FILE with `-H @file` so the key never appears on a command line.
+CONF_DIR = PRESETS.parent
+KEY_FILE = CONF_DIR / "api-key"
+HEADER_FILE = CONF_DIR / "api-key.header"
+ENV_FILE = CONF_DIR / "server.env"
 UNIT = "local-llm.service"  # not llama-server.service: Arch's llama-cpp package ships a unit by that name
 RELOAD_PATH_UNIT = "local-llm-reload.path"
 UNIT_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd/user"
@@ -47,8 +54,18 @@ def gb(n):
 
 
 # ---------------------------------------------------------------- server API
+def api_key():
+    try:
+        return KEY_FILE.read_text().strip() or None
+    except OSError:
+        return None
+
+
 def api(path, data=None, timeout=10):
     req = urllib.request.Request(SERVER + path)
+    key = api_key()
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
     if data is not None:
         req.data = json.dumps(data).encode()
         req.add_header("Content-Type", "application/json")
@@ -469,7 +486,7 @@ def cross_origin_blocked(wait=0):
             urllib.request.urlopen(req, timeout=5).close()
             return False
         except urllib.error.HTTPError as e:
-            return e.code == 403
+            return e.code in (401, 403)   # 403 = origin refused, 401 = API key required
         except OSError:
             time.sleep(1)
     return None
@@ -480,7 +497,8 @@ def warn_if_cross_origin_open(wait=0):
         print(
             "\nwarning: this llama.cpp doesn't enforce --cors-origins (needs build b12340 or newer).\n"
             "  A website open in your browser could still send requests that load or unload\n"
-            "  models (it can't read the replies). Update llama.cpp when your distro ships b12340+."
+            "  models (it can't read the replies). Update llama.cpp to b12340+, or require an\n"
+            "  API key now:  llm setup --api-key"
         )
 
 
@@ -500,6 +518,8 @@ def cmd_sandbox(args):
 
 
 def cmd_ui(args):
+    if api_key():
+        print("The server requires an API key: paste the output of `llm key` into the web UI's settings.")
     subprocess.Popen(["xdg-open", SERVER], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -534,6 +554,7 @@ ExecStart={llama_server} --host 127.0.0.1 --port 8080 --cors-origins localhost \
   --models-dir %h/.cache/llmfit/models \\
   --models-preset %E/local-llm/presets.ini \\
   --models-max 1
+EnvironmentFile=-%E/local-llm/server.env
 Restart=on-failure
 RestartSec=3
 
@@ -546,7 +567,7 @@ Description=Rescan the local-llm models dir and presets
 
 [Service]
 Type=oneshot
-ExecStart=-{curl} -sf -o /dev/null --max-time 10 "http://127.0.0.1:8080/models?reload=1"
+ExecStart=-{llm} reload
 """,
     RELOAD_PATH_UNIT: """\
 [Unit]
@@ -621,8 +642,14 @@ def cmd_setup(args):
 
     print("Setting up the llama.cpp router (user-level, no sudo):")
     MODELS.mkdir(parents=True, exist_ok=True)
+    key_before = api_key()
+    if "--api-key" in args:
+        enable_api_key()
+    elif "--no-api-key" in args:
+        disable_api_key()
+    key_changed = api_key() != key_before
     for name, body in UNIT_FILES.items():
-        write_if_wanted(UNIT_DIR / name, body.format(llama_server=llama_server, curl=curl))
+        write_if_wanted(UNIT_DIR / name, body.format(llama_server=llama_server, curl=curl, llm=SELF))
     if PRESETS.exists():
         print(f"  kept     {PRESETS}")
     else:
@@ -639,11 +666,61 @@ def cmd_setup(args):
 
     systemctl("daemon-reload")
     rc = systemctl("enable", "--now", UNIT, RELOAD_PATH_UNIT)
+    if rc == 0 and key_changed:
+        rc = systemctl("restart", UNIT)   # the key is read at startup
     if rc != 0:
         die(f"couldn't start {UNIT} — see: llm logs", rc)
+    if api_key():
+        print("\nAPI key required: give clients the key from `llm key` (the panel and llm use it automatically).")
     print(f"\nllama-server is running at {SERVER} (OpenAI API: {SERVER}/v1) and starts at login.")
     print("Next: llm pull   (search Hugging Face and download a model)")
     warn_if_cross_origin_open(wait=15)
+
+
+def write_private(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(path, 0o600)
+
+
+def enable_api_key():
+    import secrets
+    key = api_key() or "llm-" + secrets.token_urlsafe(32)
+    write_private(KEY_FILE, key + "\n")
+    write_private(HEADER_FILE, f"Authorization: Bearer {key}\n")
+    write_private(ENV_FILE, f"LLAMA_ARG_API_KEY_FILE={KEY_FILE}\n")
+    print(f"  api key  required — stored in {KEY_FILE} (show it with: llm key)")
+
+
+def disable_api_key():
+    removed = False
+    for f in (ENV_FILE, HEADER_FILE, KEY_FILE):
+        if f.exists():
+            f.unlink()
+            removed = True
+    if removed:
+        print("  api key  removed — the server accepts local requests without one")
+
+
+def cmd_key(args):
+    key = api_key()
+    if not key:
+        print("No API key is set; clients need none. Require one with: llm setup --api-key")
+        return
+    print(key)
+    if sys.stdout.isatty():
+        print(f"\nGive clients base URL {SERVER}/v1 and this key (header: Authorization: Bearer <key>).",
+              file=sys.stderr)
+
+
+def cmd_reload(args):
+    """Rescan models + presets (what local-llm-reload.service runs)."""
+    try:
+        reload_server()
+    except OSError:
+        pass   # server down: it rescans on start anyway
 
 
 def cmd_uninstall(args):
@@ -660,7 +737,7 @@ def cmd_uninstall(args):
     if BIN_LINK.is_symlink() and BIN_LINK.resolve() == SELF:
         BIN_LINK.unlink()
         print(f"  removed  {BIN_LINK}")
-    print(f"\nKept your models ({MODELS}) and settings ({PRESETS}).")
+    print(f"\nKept your models ({MODELS}) and settings ({CONF_DIR}, including any API key).")
     print("Delete those two paths by hand if you want the disk space back.")
 
 
@@ -678,7 +755,10 @@ llm — Hugging Face GGUF models served by llama.cpp (router at {SERVER})
 
   llm serve | stop | restart | status | logs
   llm fit                         open llmfit (model recommendations for your hardware)
-  llm setup                       install the local-llm systemd user service
+  llm setup [--api-key|--no-api-key]
+                                  install the local-llm systemd user service;
+                                  --api-key makes every client send a key
+  llm key                         print the API key (if one is required)
   llm uninstall [-y]              remove it again (keeps models and presets)
   llm ui                          open the llama.cpp web UI
   llm edit                        edit per-model presets ({PRESETS})
@@ -696,7 +776,7 @@ COMMANDS = {
     "list": cmd_ls, "rm": cmd_rm, "unload": cmd_unload, "serve": cmd_serve,
     "start": cmd_serve, "stop": cmd_stop, "restart": cmd_restart,
     "status": cmd_status, "logs": cmd_logs, "ui": cmd_ui, "edit": cmd_edit,
-    "fit": cmd_fit, "sandbox": cmd_sandbox, "setup": cmd_setup, "uninstall": cmd_uninstall,
+    "fit": cmd_fit, "sandbox": cmd_sandbox, "setup": cmd_setup, "key": cmd_key, "reload": cmd_reload, "uninstall": cmd_uninstall,
 }
 
 
