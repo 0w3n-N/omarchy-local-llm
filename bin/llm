@@ -454,10 +454,41 @@ def cmd_restart(args):
     sys.exit(systemctl("restart", UNIT))
 
 
+def cross_origin_blocked(wait=0):
+    """Ask the running server whether it refuses requests from other websites.
+
+    llama.cpp enforces --cors-origins (HTTP 403) from build b12340; older builds
+    only stop echoing CORS headers, so a web page can't read the replies but can
+    still send simple POSTs (e.g. load/unload a model). Probing beats parsing
+    versions: source builds often report "build 1". None = server not reachable.
+    """
+    import time
+    for _ in range(max(1, wait)):
+        req = urllib.request.Request(SERVER + "/models", headers={"Origin": "https://example.invalid"})
+        try:
+            urllib.request.urlopen(req, timeout=5).close()
+            return False
+        except urllib.error.HTTPError as e:
+            return e.code == 403
+        except OSError:
+            time.sleep(1)
+    return None
+
+
+def warn_if_cross_origin_open(wait=0):
+    if cross_origin_blocked(wait) is False:
+        print(
+            "\nwarning: this llama.cpp doesn't enforce --cors-origins (needs build b12340 or newer).\n"
+            "  A website open in your browser could still send requests that load or unload\n"
+            "  models (it can't read the replies). Update llama.cpp when your distro ships b12340+."
+        )
+
+
 def cmd_status(args):
     systemctl("--no-pager", "status", UNIT)
     ln = loaded_names()
     print("\nloaded:", ", ".join(ln) if ln else "none")
+    warn_if_cross_origin_open()
 
 
 def cmd_logs(args):
@@ -499,7 +530,7 @@ Description=Local LLM: llama.cpp server in router mode (models from ~/.cache/llm
 After=network.target
 
 [Service]
-ExecStart={llama_server} --host 127.0.0.1 --port 8080 \\
+ExecStart={llama_server} --host 127.0.0.1 --port 8080 --cors-origins localhost \\
   --models-dir %h/.cache/llmfit/models \\
   --models-preset %E/local-llm/presets.ini \\
   --models-max 1
@@ -612,6 +643,7 @@ def cmd_setup(args):
         die(f"couldn't start {UNIT} — see: llm logs", rc)
     print(f"\nllama-server is running at {SERVER} (OpenAI API: {SERVER}/v1) and starts at login.")
     print("Next: llm pull   (search Hugging Face and download a model)")
+    warn_if_cross_origin_open(wait=15)
 
 
 def cmd_uninstall(args):

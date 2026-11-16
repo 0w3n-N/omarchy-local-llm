@@ -64,7 +64,7 @@ llm serve | stop | restart | status | logs
 llm edit                          per-model settings
 ```
 
-Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1` and use a model name from `llm ls`. The server listens on localhost only.
+Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1` and use a model name from `llm ls`. The server listens on localhost only and refuses cross-origin requests from web pages (`--cors-origins localhost`), so a website open in your browser can't list, load, or unload your models. Apps that call the API directly, like agent harnesses or `curl`, aren't affected. llama.cpp enforces this from build b12340; older builds only hide the replies from the page, which could still send requests that load or unload a model. `llm setup` and `llm status` warn when your build is one of those.
 
 ## Sandbox: let models run commands without touching your system
 
