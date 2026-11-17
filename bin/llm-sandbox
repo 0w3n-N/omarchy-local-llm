@@ -369,6 +369,12 @@ def shim_main(argv):
     sys.exit(exec_in(cfg, ["bash", *argv]))
 
 
+# omp's own tools that would run code on the host stay off: eval (Python/JS
+# cells), task (subagents), debug (attaches to host processes), lsp (starts
+# language servers on the host).
+OMP_TOOLS = "read,edit,write,bash,grep,glob,todo,wait,web_search"
+
+
 def cmd_with(args):
     """Run a harness on the host with its shell swapped for sandbox-bash."""
     if not args:
@@ -380,7 +386,20 @@ def cmd_with(args):
     exe = shutil.which(args[0])
     if not exe:
         die(f"'{args[0]}' isn't on your PATH")
-    env = dict(os.environ, SHELL=str(shim), CLAUDE_CODE_SHELL=str(shim),
+    if Path(exe).name == "omp":
+        # omp's bash tool runs on its built-in shell engine and ignores $SHELL and
+        # shellPath, so an extension replaces the tool instead.
+        ext = SELF.parent / "omp-sandbox.ts"
+        if not ext.exists():
+            die(f"{ext} is missing, so omp's bash would run on the host")
+        extra = ["-e", str(ext)]
+        if not any(a.startswith("--tools") for a in args[1:]):
+            interactive = not any(a in ("-p", "--print", "--mode") or a.startswith("--mode=") for a in args[1:])
+            tools = OMP_TOOLS + (",ask" if interactive else "")  # omp rejects `ask` outside interactive mode
+            extra.append(f"--tools={tools}")
+            say(f"omp: tools {tools} (eval, task, debug and lsp would run on the host)")
+        args = [args[0], *extra, *args[1:]]
+    env = dict(os.environ, SHELL=str(shim), CLAUDE_CODE_SHELL=str(shim), LLM_SANDBOX_SHIM=str(shim),
                LLM_SANDBOX_WORKSPACE=cfg["workspace"])
     here = Path.cwd().resolve()
     ws = Path(cfg["workspace"])

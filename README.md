@@ -88,7 +88,11 @@ llm sandbox run <command>         run one command inside
 llm sandbox status | stop | reset | offline | online | install <pkg> | config | remove
 ```
 
-For harnesses you start some other way, set their shell to `~/.local/bin/sandbox-bash`, either as `SHELL=` or in the harness's shell setting (`shellPath` in pi/oh-my-pi, `CLAUDE_CODE_SHELL` in Claude Code). It accepts the same arguments as bash (`-c`, `-l -c`, scripts, stdin), returns the same exit codes, and passes kills and timeouts through to the command inside.
+`~/.local/bin/sandbox-bash` is a drop-in bash for the box. It accepts the same arguments as bash (`-c`, `-l -c`, scripts, stdin), returns the same exit codes, and passes kills and timeouts through to the command inside. How a harness is pointed at it differs:
+
+- **Claude Code:** `CLAUDE_CODE_SHELL=~/.local/bin/sandbox-bash` (`llm sandbox with claude` sets it).
+- **oh-my-pi (omp):** use `llm sandbox with omp`. omp's bash tool runs on its own built-in shell and ignores `$SHELL` and its `shellPath` setting, so `with omp` loads `bin/omp-sandbox.ts`, a small extension that replaces the bash tool and hands each command to `sandbox-bash` as one argument. It also leaves off omp's tools that would run code on the host (`eval`, `task`, `debug`, `lsp`). Don't use omp's command-prefix setting for this: it is pasted in front of the command as text, so in `a; b` only `a` would run in the box.
+- **Anything else:** set its shell setting or `SHELL=` to `~/.local/bin/sandbox-bash`, then have the model run `hostname`. Inside the box it prints `sandbox`. If it prints your computer's name, the harness doesn't use that setting for its bash tool.
 
 What the box can reach:
 
