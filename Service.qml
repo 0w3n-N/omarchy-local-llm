@@ -34,7 +34,7 @@ Item {
   // or presets change, and by `lllm bench`). Values are only numbers we check.
   readonly property string rankPath: (Quickshell.env("XDG_CACHE_HOME") || Quickshell.env("HOME") + "/.cache") + "/local-llm/rank.json"
   readonly property bool sortByScore: setting("modelOrder", "score") !== "server"
-  property var rank: ({})          // { id: { score, measured, tps, quiz } }
+  property var rank: ({})          // { id: { score, measured, failed, tps, quiz, sizeGb } }
   property var models: []          // [{ id, status, vision, aliases }]
   property int vramMiB: -1         // llama-server VRAM, -1 = unknown
   property int gpuUsedMiB: 0       // whole GPU, every process
@@ -138,7 +138,8 @@ Item {
         measured: r.measured === true,
         failed: r.failed === true,
         tps: typeof r.tps === "number" && isFinite(r.tps) ? Math.round(r.tps) : -1,
-        quiz: typeof r.quiz === "string" && /^\d{1,2}\/\d{1,2}$/.test(r.quiz) ? r.quiz : ""
+        quiz: typeof r.quiz === "string" && /^\d{1,2}\/\d{1,2}$/.test(r.quiz) ? r.quiz : "",
+        sizeGb: typeof r.size_gb === "number" && isFinite(r.size_gb) && r.size_gb >= 0 ? Math.round(r.size_gb * 10) / 10 : -1
       }
     }
     return out

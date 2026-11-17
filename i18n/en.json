@@ -40,6 +40,7 @@
   "rank.score": "score %1",
   "rank.estimated": "score ~%1",
   "rank.failed": "failed its last benchmark",
+  "rank.size": "%1 GB",
   "status.loaded": "loaded",
   "status.loadedVram": "loaded · %1 GB VRAM",
   "status.sleeping": "asleep · weights freed, wakes on next request",

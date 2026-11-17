@@ -1528,6 +1528,7 @@ def rank_models(write=True):
             skipped.append(name)
             continue
         score, detail = model_score(prof, bench.get(name), vram)
+        detail["size_gb"] = round((prof["file_bytes"] + prof["extra_bytes"]) / 2**30, 1)
         ranked.append((name, score, detail))
     ranked.sort(key=lambda r: -r[1])
     if write:
@@ -1553,7 +1554,7 @@ def cmd_rank(args):
         print("no models to rank (lllm ls)")
         return
     w = max(len(n) for n, _, _ in ranked)
-    print(f"{'#':>2}  {'SCORE':>5}  {'MODEL':<{w}}  BASIS")
+    print(f"{'#':>2}  {'SCORE':>5}  {'MODEL':<{w}}  {'SIZE':>7}  BASIS")
     for i, (n, s, d) in enumerate(ranked, 1):
         if d.get("failed"):
             basis = "failed to load in its last benchmark"
@@ -1561,9 +1562,9 @@ def cmd_rank(args):
             basis = f"measured: quiz {d['quiz']}, {d['tps']} tok/s"
         else:
             basis = f"estimated from the file (~{d['tps_est']} tok/s); `lllm bench {n}` measures it"
-        print(f"{i:>2}  {s:>5}  {n:<{w}}  {basis}")
+        print(f"{i:>2}  {s:>5}  {n:<{w}}  {d['size_gb']:>4.1f} GB  {basis}")
     for n in skipped:
-        print(f" -      -  {n:<{w}}  not a chat model (drafter sidecar or unreadable)")
+        print(f" -      -  {n:<{w}}  {'':>7}  not a chat model (drafter sidecar or unreadable)")
     print(f"\nScore = {int(QUALITY_WEIGHT * 100)}% quality + {100 - int(QUALITY_WEIGHT * 100)}% speed. "
           "The panel lists models in this order.")
 
@@ -1575,30 +1576,158 @@ def _chat(model, prompt, max_tokens, thinking, timeout=1800):
     }, timeout=timeout)
 
 
-def bench_one(name, say=print):
+BENCH_STATUS = RANK_FILE.parent / "bench-status.json"   # live progress, for anything that wants to show it
+QUIZ_SLOTS = len(QUIZ)
+QUIZ_SLOT_CTX = 8192   # prompt + QUIZ_MAX_TOKENS per question
+
+
+def _write_status(status):
+    try:
+        BENCH_STATUS.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BENCH_STATUS.with_suffix(".tmp")
+        tmp.write_text(json.dumps(status))
+        os.replace(tmp, BENCH_STATUS)
+    except OSError:
+        pass
+
+
+def _free_port():
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _quiz_server_cmd(model):
+    """llama-server argv for a temporary copy of a router model with one slot per quiz
+    question, built from the router's own resolved preset (model, drafter, cache types…)."""
+    binary = (model["status"].get("args") or [shutil.which("llama-server")])[0]
+    cmd = [binary]
+    for line in (model["status"].get("preset") or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith(("[", ";", "#")) or "=" not in line:
+            continue
+        key, val = (x.strip() for x in line.split("=", 1))
+        if key in ("port", "host", "parallel", "ctx-size", "alias", "sleep-idle-seconds", "api-key", "api-key-file"):
+            continue
+        cmd += [f"--{key}"] if val.lower() == "true" else [f"--{key}", val]
+    port = _free_port()
+    cmd += ["--host", "127.0.0.1", "--port", str(port), "--parallel", str(QUIZ_SLOTS),
+            "--ctx-size", str(QUIZ_SLOTS * QUIZ_SLOT_CTX)]
+    if KEY_FILE.exists():
+        cmd += ["--api-key-file", str(KEY_FILE)]   # same rule as the router: no keyless side door
+    return cmd, port
+
+
+def _post_json(url, body, timeout):
+    req = urllib.request.Request(url, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    key = api_key()
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def _quiz_parallel(model, status):
+    """All quiz questions at once on a temporary server (one slot each). Returns
+    [(answer_text, tokens)], or None when that server can't start (caller falls back)."""
+    import threading
+
+    cmd, port = _quiz_server_cmd(model)
+    log = RANK_FILE.parent / "bench-server.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "w") as lf:
+        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        base = f"http://127.0.0.1:{port}"
+        for _ in range(900):   # big models can take minutes to load
+            if proc.poll() is not None:
+                return None
+            try:
+                with urllib.request.urlopen(base + "/health", timeout=2) as r:
+                    if r.status == 200:
+                        break
+            except (urllib.error.URLError, OSError):
+                pass
+            time.sleep(1)
+        else:
+            return None
+        status.update(step="quiz", port=port)
+        _write_status(status)
+        results = [None] * len(QUIZ)
+
+        def ask(i, q):
+            try:
+                r = _post_json(base + "/v1/chat/completions", {
+                    "messages": [{"role": "user", "content": q + QUIZ_SUFFIX}], "max_tokens": QUIZ_MAX_TOKENS,
+                    "temperature": 0.6, "top_p": 0.95, "seed": 42,
+                    "chat_template_kwargs": {"enable_thinking": True}}, timeout=3600)
+                results[i] = (r["choices"][0]["message"].get("content") or "", r.get("timings", {}).get("predicted_n", 0))
+            except (urllib.error.URLError, OSError, ValueError, KeyError):
+                results[i] = ("", 0)
+
+        threads = [threading.Thread(target=ask, args=(i, q)) for i, (q, _) in enumerate(QUIZ)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return results
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        status.pop("port", None)
+
+
+def _unload_all():
     for m in server_models(reload=False) or []:
         if m["status"]["value"] in ("loaded", "loading", "sleeping"):
             unload(m["id"])
-    time.sleep(2)
+    for _ in range(30):
+        if not any(m["status"]["value"] in ("loaded", "loading", "unloading")
+                   for m in server_models(reload=False) or []):
+            break
+        time.sleep(1)
+
+
+def bench_one(name, status, say=print):
+    """Speed through the router (the model's real settings), then the quiz on a
+    temporary multi-slot copy so all questions run at once."""
+    _unload_all()
     t0 = time.time()
+    status.update(current=name, step="loading", model_started=t0)
+    _write_status(status)
     try:
         say("  loading…")
         _chat(name, "Say hi.", 8, False, timeout=900)
         load_s = time.time() - t0
         say("  speed test…")
+        status["step"] = "speed"
+        _write_status(status)
         r = _chat(name, "Write a vivid 400-word short story about a lighthouse keeper who finds a message in a bottle.",
                   400, False)
         t = r.get("timings", {})
         res = {"gen_tps": round(t.get("predicted_per_second", 0), 1), "load_s": round(load_s, 1)}
         if t.get("draft_n"):
             res["draft_accept"] = round(t.get("draft_n_accepted", 0) / t["draft_n"], 2)
-        ok = think = 0
-        for i, (q, want) in enumerate(QUIZ, 1):
-            say(f"  quiz {i}/{len(QUIZ)}…")
-            r = _chat(name, q + QUIZ_SUFFIX, QUIZ_MAX_TOKENS, True)
-            ok += quiz_answer(r["choices"][0]["message"].get("content") or "") == want
-            think += r.get("timings", {}).get("predicted_n", 0)
-        res.update(quiz_ok=ok, quiz_n=len(QUIZ), think_tokens=think // len(QUIZ))
+        model = next((m for m in server_models(reload=False) or [] if m["id"] == name), None)
+        _unload_all()   # free VRAM for the quiz server
+        say(f"  quiz ({len(QUIZ)} questions at once)…")
+        status["step"] = "quiz-loading"
+        _write_status(status)
+        answers = _quiz_parallel(model, status) if model else None
+        if answers is None:   # couldn't start a multi-slot copy: ask through the router, one by one
+            say("  (one question at a time)")
+            answers = []
+            for q, _ in QUIZ:
+                r = _chat(name, q + QUIZ_SUFFIX, QUIZ_MAX_TOKENS, True)
+                answers.append((r["choices"][0]["message"].get("content") or "", r.get("timings", {}).get("predicted_n", 0)))
+        ok = sum(quiz_answer(text) == want for (text, _), (_, want) in zip(answers, QUIZ))
+        res.update(quiz_ok=ok, quiz_n=len(QUIZ), think_tokens=sum(n for _, n in answers) // len(QUIZ),
+                   seconds=round(time.time() - t0))
     except urllib.error.HTTPError as e:
         res = {"error": f"HTTP {e.code}: {e.read().decode(errors='replace')[:200]}"}
     except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
@@ -1610,28 +1739,38 @@ def bench_one(name, say=print):
 def cmd_bench(args):
     yes = "-y" in args
     names = [a for a in args if not a.startswith("-")]
+    srv = server_models(reload=False)
+    if srv is None:
+        die("the server isn't running — lllm serve")
     if "--all" in args:
         names = [n for n, p in local_models().items() if model_profile(p) is not None]
+    elif "--missing" in args:
+        have = load_bench()
+        names = [n for n, p in local_models().items() if model_profile(p) is not None and n not in have]
     if not names:
-        die("usage: lllm bench <model…> | --all [-y]   (speed + a 4-question reasoning quiz per model)")
-    names = [resolve_local(n)[0] for n in names]
-    if server_models(reload=False) is None:
-        die("the server isn't running — lllm serve")
+        die("usage: lllm bench <model…> | --missing | --all [-y]   (speed + a 4-question reasoning quiz)")
+    served = {m["id"] for m in srv}
+    names = [n if n in served else resolve_local(n)[0] for n in names]
     if not yes and sys.stdin.isatty() and not confirm(
-            f"Benchmark {len(names)} model(s)? Each is loaded in turn (unloading whatever is loaded) and takes "
-            "about 1-10 minutes."):
+            f"Benchmark {len(names)} model(s)? Each is loaded in turn (unloading whatever is loaded); "
+            "small models take about a minute, big ones a few."):
         die("aborted")
     data = load_bench()
-    for i, n in enumerate(names, 1):
-        print(f"[{i}/{len(names)}] {n}")
-        data[n] = bench_one(n)
-        save_bench(data)
-        r = data[n]
-        print("  " + (r["error"] if "error" in r else
-                      f"{r['gen_tps']} tok/s, quiz {r['quiz_ok']}/{r['quiz_n']}, ~{r['think_tokens']} thinking tokens/question"))
-    for m in server_models(reload=False) or []:
-        if m["status"]["value"] in ("loaded", "sleeping"):
-            unload(m["id"])
+    status = {"pid": os.getpid(), "queue": names, "started": time.time(), "done": []}
+    try:
+        for i, n in enumerate(names, 1):
+            print(f"[{i}/{len(names)}] {n}")
+            data[n] = bench_one(n, status)
+            save_bench(data)
+            status["done"].append(n)
+            r = data[n]
+            print("  " + (r["error"] if "error" in r else
+                          f"{r['gen_tps']} tok/s, quiz {r['quiz_ok']}/{r['quiz_n']}, "
+                          f"~{r['think_tokens']} thinking tokens/question, {r['seconds']}s"))
+            rank_models(write=True)   # the panel re-sorts as results come in
+    finally:
+        BENCH_STATUS.unlink(missing_ok=True)
+        _unload_all()
     print()
     cmd_rank([])
 
@@ -1695,7 +1834,7 @@ def completions(words, cword):
         flags = [f for f in ("--color", "--no-color") if f not in rest]
         return flags + ([] if any(a in models for a in rest) else models)
     if cmd == "bench":
-        return [f for f in ("--all", "-y") if f not in rest] + [m for m in models if m not in rest]
+        return [f for f in ("--missing", "--all", "-y") if f not in rest] + [m for m in models if m not in rest]
     if cmd == "rank":
         return [] if rest else ["--json"]
     if cmd == "rm":
@@ -1787,7 +1926,8 @@ lllm — Hugging Face GGUF models served by llama.cpp (router at {SERVER})
   lllm info <model>               what a model is: architecture, MoE, quantization,
                                   context/KV memory, drafting, vision, fit on your GPU
   lllm rank                       models best-first (the panel's order), measured or estimated
-  lllm bench <model…>|--all       measure speed + a 4-question reasoning quiz (feeds rank)
+  lllm bench <model…>|--missing   measure speed + a 4-question reasoning quiz (feeds rank;
+                                  --all re-measures everything)
   lllm rm <model> [-y]            delete a model
   lllm unload [model]             free VRAM now (default: all loaded)
 
