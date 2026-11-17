@@ -36,7 +36,7 @@
   "model.unload": "Unload",
   "model.vision": "vision",
   "model.alias": "alias %1",
-  "rank.measured": "score %1 · %2 tok/s · quiz %3",
+  "rank.measured": "%1 tok/s · quiz %2",
   "rank.score": "score %1",
   "rank.estimated": "score ~%1",
   "rank.failed": "failed its last benchmark",
