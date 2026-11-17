@@ -1301,6 +1301,7 @@ def cmd_setup(args):
         BIN_LINK.parent.mkdir(parents=True, exist_ok=True)
         BIN_LINK.symlink_to(SELF)
         print(f"  linked   {BIN_LINK} -> {SELF}")
+    install_completion()
 
     systemctl("daemon-reload")
     rc = systemctl("enable", "--now", UNIT, RELOAD_PATH_UNIT)
@@ -1375,8 +1376,144 @@ def cmd_uninstall(args):
     if BIN_LINK.is_symlink() and BIN_LINK.resolve() == SELF:
         BIN_LINK.unlink()
         print(f"  removed  {BIN_LINK}")
+    remove_completion()
     print(f"\nKept your models ({MODELS}) and settings ({CONF_DIR}, including any API key).")
     print("Delete those two paths by hand if you want the disk space back.")
+
+
+# ---------------------------------------------------------------- tab completion
+# bash asks `lllm __complete <cword> <words…>` for candidates, so every menu is
+# completed by the same code that parses it. `lllm sandbox …` is handed on to
+# lllm-sandbox's own __complete. Special answers: @files, @dirs, @commands.
+COMPLETION_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "bash-completion/completions"
+COMPLETION_NAMES = ("lllm", "lllm-sandbox")
+BASH_COMPLETION = r"""# bash completion for lllm and lllm-sandbox (written by `lllm setup`; `lllm completion` prints it)
+_lllm() {
+    local cur=${COMP_WORDS[COMP_CWORD]} out IFS=$'\n'
+    out=$("${COMP_WORDS[0]}" __complete "$COMP_CWORD" "${COMP_WORDS[@]}" 2>/dev/null) || return
+    case $out in
+        @files) compopt -o filenames 2>/dev/null; COMPREPLY=($(compgen -f -- "$cur")) ;;
+        @dirs) compopt -o filenames 2>/dev/null; COMPREPLY=($(compgen -d -- "$cur")) ;;
+        @commands) COMPREPLY=($(compgen -c -- "$cur")) ;;
+        *) COMPREPLY=($(compgen -W "$out" -- "$cur")) ;;
+    esac
+}
+complete -F _lllm lllm lllm-sandbox
+"""
+JOURNAL_FLAGS = ["--since", "--until", "-n", "--lines", "-o", "--output", "-p", "--priority", "--grep",
+                 "--no-pager", "-r", "--reverse", "-b", "--boot", "-x", "--catalog"]
+
+
+def _help_words(argv):
+    """Subcommands and --flags from a program's --help (for `lllm fit`, which passes through to llmfit)."""
+    try:
+        text = subprocess.run(argv, capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return [], []
+    subs, flags, in_cmds = [], [], False
+    for line in text.splitlines():
+        if re.match(r"^\S.*:\s*$", line):
+            in_cmds = line.strip().lower().startswith(("commands", "subcommands"))
+            continue
+        m = re.match(r"^\s{2,}([a-z][\w-]*)(\s{2,}|$)", line)
+        if in_cmds and m and m.group(1) != "help":
+            subs.append(m.group(1))
+        m = re.match(r"^\s+((?:-[A-Za-z], )?--?[A-Za-z][\w-]*)", line)
+        if m:
+            flags += re.findall(r"--?[A-Za-z][\w-]*", m.group(1))
+    return subs, sorted(set(f for f in flags if f not in ("-h", "--help")))
+
+
+def completions(words, cword):
+    """Candidates for words[cword] (bash filters them by what's typed)."""
+    if cword <= 1:
+        return [c for c in COMMANDS if not c.startswith("_") and c not in ("list", "start")] + ["help"]
+    cmd, rest, prev = words[1], words[2:cword], words[cword - 1]
+    models = list(local_models())
+    if cmd == "search":
+        return ["5", "10", "20", "50"] if prev == "-n" else [] if "-n" in rest else ["-n"]
+    if cmd == "pull":
+        if prev == "--name":
+            return []
+        return [f for f in ("--name", "--no-mmproj") if f not in rest]
+    if cmd == "info":
+        flags = [f for f in ("--color", "--no-color") if f not in rest]
+        return flags + ([] if any(a in models for a in rest) else models)
+    if cmd == "rm":
+        return (["-y"] if "-y" not in rest else []) + ([] if any(a in models for a in rest) else models)
+    if cmd == "unload":
+        loaded = []
+        try:
+            loaded = [m["id"] for m in api("/models", timeout=0.5)["data"]
+                      if m["status"]["value"] in ("loaded", "loading", "sleeping")]
+        except (urllib.error.URLError, OSError, ValueError, KeyError):
+            pass
+        return [m for m in (loaded or models) if m not in rest]
+    if cmd == "setup":
+        return [] if {"--api-key", "--no-api-key"} & set(rest) else ["--api-key", "--no-api-key"]
+    if cmd == "uninstall":
+        return [] if "-y" in rest else ["-y"]
+    if cmd == "completion":
+        return [] if rest else ["bash", "install", "remove"]
+    if cmd == "logs":
+        if prev in ("-o", "--output"):
+            return ["short", "short-iso", "short-precise", "cat", "json", "json-pretty", "verbose"]
+        if prev in ("-p", "--priority"):
+            return ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"]
+        if prev in ("--since", "--until"):
+            return ["today", "yesterday", "-10min", "-1h", "-1d"]
+        if prev in ("-n", "--lines"):
+            return ["50", "100", "500", "1000"]
+        return JOURNAL_FLAGS
+    if cmd == "fit":
+        sub = rest[0] if rest and not rest[0].startswith("-") else None
+        subs, flags = _help_words(["llmfit", sub, "--help"] if sub else ["llmfit", "--help"])
+        return flags if sub else subs + flags
+    if cmd == "sandbox":
+        try:
+            out = subprocess.run([str(SELF.parent / "lllm-sandbox"), "__complete", str(cword - 1),
+                                  "lllm-sandbox", *words[2:]], capture_output=True, text=True, timeout=3).stdout
+            return out.split("\n")
+        except (OSError, subprocess.SubprocessError):
+            return []
+    return []
+
+
+def cmd_complete(args):
+    try:
+        cword, words = int(args[0]), args[1:]
+    except (IndexError, ValueError):
+        return
+    if cword >= len(words):
+        words = words + [""]
+    print("\n".join(w for w in completions(words, cword) if w))
+
+
+def install_completion():
+    for name in COMPLETION_NAMES:
+        write_if_wanted(COMPLETION_DIR / name, BASH_COMPLETION)
+
+
+def remove_completion():
+    for name in COMPLETION_NAMES:
+        f = COMPLETION_DIR / name
+        if f.is_file() and f.read_text() == BASH_COMPLETION:
+            f.unlink()
+            print(f"  removed  {f}")
+
+
+def cmd_completion(args):
+    """`lllm completion` prints the bash script; `install` / `remove` manage the user copy."""
+    sub = args[0] if args else "bash"
+    if sub == "bash":
+        print(BASH_COMPLETION, end="")
+    elif sub == "install":
+        install_completion()
+        print("Open a new terminal (or run: source ~/.local/share/bash-completion/completions/lllm) to use it.")
+    elif sub == "remove":
+        remove_completion()
+    else:
+        die("usage: lllm completion [bash|install|remove]")
 
 
 HELP = f"""\
@@ -1401,6 +1538,7 @@ lllm — Hugging Face GGUF models served by llama.cpp (router at {SERVER})
   lllm key                        print the API key (if one is required)
   lllm uninstall [-y]             remove it again (keeps models and presets)
   lllm ui                         open the llama.cpp web UI
+  lllm completion [install]       bash tab completion (setup installs it)
   lllm edit                       edit per-model presets ({PRESETS})
 
   lllm sandbox …                  Docker box where models run shell commands safely
@@ -1417,10 +1555,14 @@ COMMANDS = {
     "start": cmd_serve, "stop": cmd_stop, "restart": cmd_restart,
     "status": cmd_status, "logs": cmd_logs, "ui": cmd_ui, "edit": cmd_edit,
     "fit": cmd_fit, "sandbox": cmd_sandbox, "setup": cmd_setup, "key": cmd_key, "reload": cmd_reload, "uninstall": cmd_uninstall,
+    "completion": cmd_completion, "__complete": cmd_complete,
 }
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "__complete":  # tab completion: fast, no side effects
+        cmd_complete(sys.argv[2:])
+        return
     migrate_legacy(quiet=len(sys.argv) > 1 and sys.argv[1] in ("_migrate", "reload"))
     if len(sys.argv) > 1 and sys.argv[1] == "_migrate":  # used by the bin/llm-sandbox shim
         return

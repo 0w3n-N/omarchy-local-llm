@@ -65,6 +65,8 @@ lllm serve | stop | restart | status | logs
 lllm edit                         per-model settings
 ```
 
+Tab completes every `lllm` command, subcommand and flag in bash, including your model names (`lllm info <Tab>`), the sandbox's commands and settings, and llmfit's own subcommands under `lllm fit`. Setup installs it to `~/.local/share/bash-completion/completions/` (needs the `bash-completion` package, which Omarchy ships); on an install from before 1.3.1, run `lllm completion install` once.
+
 `lllm info <model>` reads the model file itself and explains what it finds: the layer mix (attention, recurrent, mixture of experts), how many parameters work per token, the quantization and what it costs in quality, how much memory the context needs, built-in or sidecar speculative decoding, vision and audio input, chat-template features, and whether it fits on your GPU. Each line says what the trait means in general and what it means for that model. Any unique part of a name works: `lllm info gemma`.
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1` and use a model name from `lllm ls`. The server listens on localhost only and refuses cross-origin requests from web pages (`--cors-origins localhost`), so a website open in your browser can't list, load, or unload your models. Apps that call the API directly, like agent harnesses or `curl`, aren't affected. llama.cpp enforces this from build b12340; older builds only hide the replies from the page, which could still send requests that load or unload a model. `lllm setup` and `lllm status` warn when your build is one of those.

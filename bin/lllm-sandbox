@@ -549,7 +549,44 @@ COMMANDS = {
 }
 
 
+# ---------------------------------------------------------------- tab completion
+# `lllm-sandbox __complete <cword> <words…>` (also reached through `lllm sandbox …`).
+# Special answers the bash side expands: @files, @dirs, @commands.
+HARNESSES = ("omp", "opencode", "claude", "codex", "aider", "crush", "gemini", "goose", "amp", "pi", "qwen")
+CONFIG_KEYS = ("workspace", "network", "memory", "cpus", "pids", "env")
+CONFIG_VALUES = {"network": ["on", "off"], "memory": ["4g", "8g", "16g"], "cpus": ["2", "4", "8"],
+                 "pids": ["512", "1024", "2048"]}
+FLAGS = {"setup": ["--rebuild"], "reset": ["--rebuild"], "remove": ["-y"]}
+
+
+def completions(words, cword):
+    if cword <= 1:
+        return list(COMMANDS) + ["help"]
+    sub, rest = words[1], words[2:cword]
+    if sub in FLAGS:
+        return [f for f in FLAGS[sub] if f not in rest]
+    if sub in ("run", "exec"):
+        return ["@commands"] if cword == 2 else ["@files"]
+    if sub == "with":
+        if cword == 2:
+            return [h for h in HARNESSES if shutil.which(h)] or ["@commands"]
+        return ["@files"]
+    if sub == "config":
+        if cword == 2:
+            return list(CONFIG_KEYS)
+        if cword == 3:
+            key = words[2]
+            return ["@dirs"] if key == "workspace" else sorted(os.environ) if key == "env" \
+                else CONFIG_VALUES.get(key, [])
+    return []
+
+
 def main():
+    if len(sys.argv) > 2 and sys.argv[1] == "__complete":
+        cword, words = int(sys.argv[2]), sys.argv[3:]
+        words += [""] * (cword + 1 - len(words))
+        print("\n".join(w for w in completions(words, cword) if w))
+        return
     # the pre-1.3.0 bin/llm-sandbox shim passes the name it was run as (a #! script
     # sees its real path in argv[0], not the sandbox-bash link it was called through)
     invoked_as = os.environ.pop("LLLM_SANDBOX_ARGV0", "") or Path(sys.argv[0]).name
