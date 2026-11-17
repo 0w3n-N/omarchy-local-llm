@@ -60,9 +60,12 @@ llm quants <user/repo>            list quantizations with size and fit
 llm pull                          interactive: search, pick repo, pick quant
 llm pull <user/repo>[:QUANT]      download directly
 llm ls | rm <model> | unload      list, delete, free VRAM now
+llm info <model>                  explain a model: layers, experts, quantization, memory, fit
 llm serve | stop | restart | status | logs
 llm edit                          per-model settings
 ```
+
+`llm info <model>` reads the model file itself and explains what it finds: the layer mix (attention, recurrent, mixture of experts), how many parameters work per token, the quantization and what it costs in quality, how much memory the context needs, built-in or sidecar speculative decoding, vision and audio input, chat-template features, and whether it fits on your GPU. Each line says what the trait means in general and what it means for that model. Any unique part of a name works: `llm info gemma`.
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1` and use a model name from `llm ls`. The server listens on localhost only and refuses cross-origin requests from web pages (`--cors-origins localhost`), so a website open in your browser can't list, load, or unload your models. Apps that call the API directly, like agent harnesses or `curl`, aren't affected. llama.cpp enforces this from build b12340; older builds only hide the replies from the page, which could still send requests that load or unload a model. `llm setup` and `llm status` warn when your build is one of those.
 

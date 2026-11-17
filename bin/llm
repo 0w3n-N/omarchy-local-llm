@@ -208,6 +208,595 @@ def resolve_local(name):
     die(f"no local model matching '{name}' (see `llm ls`)")
 
 
+# ---------------------------------------------------------------- model info
+# `llm info <model>` reads the GGUF header (no extra packages) and explains each
+# trait twice: what it means in general, and what this model's value implies.
+GGUF_SCALAR = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?",
+               10: "<Q", 11: "<q", 12: "<d"}
+GGML_TYPES = {
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1", 8: "Q8_0", 9: "Q8_1",
+    10: "Q2_K", 11: "Q3_K", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 15: "Q8_K", 16: "IQ2_XXS",
+    17: "IQ2_XS", 18: "IQ3_XXS", 19: "IQ1_S", 20: "IQ4_NL", 21: "IQ3_S", 22: "IQ2_S",
+    23: "IQ4_XS", 24: "I8", 25: "I16", 26: "I32", 27: "I64", 28: "F64", 29: "IQ1_M",
+    30: "BF16", 34: "TQ1_0", 35: "TQ2_0", 39: "MXFP4", 40: "NVFP4", 41: "Q1_0", 42: "Q2_0",
+    43: "F8_E4M3",
+}
+FILE_TYPES = {
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0", 9: "Q5_1", 10: "Q2_K",
+    11: "Q3_K_S", 12: "Q3_K_M", 13: "Q3_K_L", 14: "Q4_K_S", 15: "Q4_K_M", 16: "Q5_K_S",
+    17: "Q5_K_M", 18: "Q6_K", 19: "IQ2_XXS", 20: "IQ2_XS", 21: "Q2_K_S", 22: "IQ3_XS",
+    23: "IQ3_XXS", 24: "IQ1_S", 25: "IQ4_NL", 26: "IQ3_S", 27: "IQ3_M", 28: "IQ2_S",
+    29: "IQ2_M", 30: "IQ4_XS", 31: "IQ1_M", 32: "BF16", 36: "TQ1_0", 37: "TQ2_0",
+    38: "MXFP4_MOE", 39: "NVFP4", 40: "Q1_0", 41: "Q2_0", 42: "F8_E4M3",
+}
+# bytes per KV-cache element for llama.cpp's --cache-type-k/v values
+KV_BYTES = {"f32": 4, "f16": 2, "bf16": 2, "q8_0": 34 / 32, "q5_1": 24 / 32, "q5_0": 22 / 32,
+            "q4_1": 20 / 32, "q4_0": 18 / 32, "iq4_nl": 18 / 32}
+FAMILIES = [("qwen", "Qwen (Alibaba)"), ("gemma", "Gemma (Google)"), ("nemotron", "Nemotron (NVIDIA)"),
+            ("lfm", "LFM (Liquid AI)"), ("llama", "Llama (Meta)"), ("deepseek", "DeepSeek"),
+            ("glm", "GLM (Z.ai)"), ("mistral", "Mistral"), ("phi", "Phi (Microsoft)"),
+            ("gpt-oss", "gpt-oss (OpenAI)"), ("granite", "Granite (IBM)"), ("olmo", "OLMo (Ai2)"),
+            ("minimax", "MiniMax"), ("kimi", "Kimi (Moonshot)"), ("dflash", "DFlash drafter")]
+UNCENSORED_RE = re.compile(r"heretic|abliterat|obliterat|uncensor|derestrict|jbliterat|unlocked", re.I)
+
+
+def read_gguf(path, tensors=True):
+    """(metadata dict, [(name, dims, ggml_type)]) from a GGUF file's header."""
+    import struct
+
+    with open(path, "rb") as f:
+        def rd(fmt):
+            return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
+
+        def rstr():
+            return f.read(rd("<Q")).decode("utf-8", "replace")
+
+        def rval(t):
+            if t in GGUF_SCALAR:
+                return rd(GGUF_SCALAR[t])
+            if t == 8:
+                return rstr()
+            if t == 9:
+                et, cnt = rd("<I"), rd("<Q")
+                if et == 8:
+                    if cnt <= 4096:
+                        return [rstr() for _ in range(cnt)]
+                    for _ in range(cnt):  # vocabularies: skip, keep the length
+                        f.seek(rd("<Q"), 1)
+                    return _Len(cnt)
+                size = struct.calcsize(GGUF_SCALAR[et])
+                if cnt <= 4096:
+                    return list(struct.unpack(f"<{cnt}{GGUF_SCALAR[et][1]}", f.read(size * cnt)))
+                f.seek(size * cnt, 1)
+                return _Len(cnt)
+            raise ValueError(f"unknown GGUF value type {t}")
+
+        if f.read(4) != b"GGUF":
+            raise ValueError("not a GGUF file")
+        _ver, n_tensors, n_kv = rd("<I"), rd("<Q"), rd("<Q")
+        kv = {}
+        for _ in range(n_kv):
+            key = rstr()
+            kv[key] = rval(rd("<I"))
+        out = []
+        if tensors:
+            for _ in range(n_tensors):
+                name = rstr()
+                dims = [rd("<Q") for _ in range(rd("<I"))]
+                typ = rd("<I")
+                rd("<Q")  # data offset
+                out.append((name, dims, typ))
+        return kv, out
+
+
+class _Len(int):
+    """Stands in for a long array we skipped; int() is its length."""
+
+
+def _prod(dims):
+    n = 1
+    for d in dims:
+        n *= d
+    return n
+
+
+def _fmt_params(n):
+    return f"{n / 1e9:.1f}B" if n >= 1e9 else f"{n / 1e6:.0f}M"
+
+
+def _per_layer(v, i, default=0):
+    if isinstance(v, list):
+        return v[i] if i < len(v) else default
+    return default if v is None else v
+
+
+def _most_common_nonzero(v):
+    if not isinstance(v, list):
+        return v
+    vals = [x for x in v if x]
+    return max(set(vals), key=vals.count) if vals else 0
+
+
+def _model_files(path):
+    """(main gguf, mmproj or None, [draft sidecars]) of a local model."""
+    if path.is_file():
+        return path, None, []
+    ggufs = sorted(path.glob("*.gguf"))
+    mmproj = next((g for g in ggufs if "mmproj" in g.name), None)
+    drafts = [g for g in ggufs if g.name.startswith(("mtp-", "dflash-", "dspark-"))]
+    rest = [g for g in ggufs if g != mmproj and g not in drafts]
+    shards = [g for g in rest if "-00001-of-" in g.name]
+    main = shards[0] if shards else max(rest, key=lambda g: g.stat().st_size)
+    return main, mmproj, drafts
+
+
+def _preset(name):
+    """Effective presets.ini settings for a model ([*] then its own section)."""
+    import configparser
+
+    cp = configparser.ConfigParser(interpolation=None, strict=False, comment_prefixes=(";", "#"))
+    try:
+        cp.read(PRESETS)
+    except configparser.Error:
+        return {}
+    out = dict(cp["*"]) if cp.has_section("*") else {}
+    if cp.has_section(name):
+        out.update(cp[name])
+    return out
+
+
+def _gpu():
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, check=True, timeout=5).stdout.strip().splitlines()[0]
+        name, mib = [x.strip() for x in out.split(",")]
+        return name, int(mib) * 2**20
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None, 0
+
+
+class _Out:
+    """Prints the report: sections, and traits with a general + specific note."""
+
+    def __init__(self, color):
+        self.c = color
+        self.w = max(60, min(shutil.get_terminal_size((100, 24)).columns, 110))
+
+    def _s(self, code, text):
+        return f"\033[{code}m{text}\033[0m" if self.c else text
+
+    def title(self, name, sub):
+        print(self._s("1", name))
+        if sub:
+            print(self._s("2", sub))
+
+    def section(self, name):
+        print("\n" + self._s("1;36", name.upper()))
+
+    def trait(self, label, value, what=None, here=None, warn=False):
+        import textwrap
+
+        print(f"  {self._s('1', label)}  {self._s('33' if warn else '0', value)}")
+        for tag, text, code in (("what it is", what, "2"), ("this model", here, "0")):
+            if not text:
+                continue
+            prefix = f"      {tag:<11} "
+            lines = textwrap.wrap(text, self.w - len(prefix)) or [""]
+            print(self._s("2", prefix) + self._s(code, lines[0]))
+            for line in lines[1:]:
+                print(" " * len(prefix) + self._s(code, line))
+
+
+def _quant_family(q):
+    q = q.upper()
+    if q in ("F32", "F16", "BF16"):
+        return "Full precision: weights stored as 16/32-bit floats, exactly as trained. Largest files, no quality loss."
+    if q == "F8_E4M3":
+        return "8-bit floating point (E4M3). Nearly lossless at half the size of 16-bit."
+    if q.startswith("NVFP4"):
+        return ("NVIDIA's 4-bit floating-point format: each weight is a tiny float (E2M1) and every 16 weights "
+                "share an 8-bit scale. Blackwell GPUs (RTX 50 series) have FP4 tensor cores for it.")
+    if q.startswith("MXFP4"):
+        return ("OCP 'microscaling' 4-bit float: 32 weights share one power-of-two scale. Usually applied only to "
+                "the MoE expert weights (the _MOE suffix), the format gpt-oss was released in.")
+    if q.startswith(("TQ", "Q1_0", "Q2_0")):
+        return ("Ternary / 1-2-bit formats for models trained to live at that precision (BitNet / Bonsai style). "
+                "Quality depends on the model having been trained for it, not quantized afterwards.")
+    if q.startswith("IQ"):
+        return ("I-quants: weights are snapped to points of a precomputed codebook (lattice), guided by an "
+                "importance matrix. The best quality per bit below ~4.5 bits; a bit slower than K-quants on CPU.")
+    if "_K" in q:
+        return ("K-quants: blocks of 32 weights with their own scales, grouped into super-blocks. The _S/_M/_L "
+                "suffix says how many sensitive tensors (attention, output) get extra bits.")
+    if q == "Q8_0":
+        return "8-bit integers with one scale per 32 weights. Practically indistinguishable from full precision."
+    return "Legacy block quantization (one scale per 32 weights). Superseded by K- and I-quants at the same size."
+
+
+def _quality_note(bpw, params):
+    big = params >= 20e9
+    if bpw >= 7.5:
+        return "Near-lossless; the only cost is size and memory bandwidth (so speed)."
+    if bpw >= 5.5:
+        return "Very close to the original; differences rarely show in practice."
+    if bpw >= 4.3:
+        return "The usual sweet spot: small, measurable loss that is hard to notice in chat."
+    if bpw >= 3.3:
+        return ("Noticeable compression. " + ("Large models like this one tolerate it well; this is how a "
+                "model this size fits a consumer GPU." if big else "Small models lose more at this level; "
+                "a higher quant is worth it if it fits."))
+    return ("Aggressive compression. " + ("Usable on very large or quantization-aware-trained models; expect "
+            "some drift on precise tasks (math, code)." if big else "Expect clear quality loss on a model this "
+            "small unless it was trained for low-bit."))
+
+
+def cmd_info(args):
+    color = ("--color" in args or sys.stdout.isatty()) and "--no-color" not in args and not os.environ.get("NO_COLOR")
+    args = [a for a in args if a not in ("--color", "--no-color")]
+    if not args:
+        print("usage: llm info <model>   (any unique part of a name from `llm ls`)\n")
+        for n in local_models():
+            print(f"  {n}")
+        return
+    name, path = resolve_local(args[0])
+    main, mmproj, drafts = _model_files(path)
+    try:
+        kv, tensors = read_gguf(main)
+    except (OSError, ValueError, KeyError) as e:
+        die(f"can't read {main.name}: {e}")
+    arch = kv.get("general.architecture", "?")
+    A = lambda k, d=None: kv.get(f"{arch}.{k}", d)  # noqa: E731
+    preset = _preset(name)
+    out = _Out(color)
+    if arch == "dflash" or arch.endswith(("-assistant", "_assistant")) or main.name.startswith(("mtp-", "dflash-", "dspark-")):
+        out.title(name, f"{main.name}  ·  {gb(disk_size(path))} on disk")
+        out.section("Draft model")
+        out.trait("What this is", f"{arch} drafter for {kv.get('general.name', 'a larger model')}",
+                  "A small model used only for speculative decoding: it guesses tokens ahead and the big model "
+                  "checks them. It can't chat on its own.",
+                  "The router ignores it as a model. Move it into the folder of the model it belongs to (next to "
+                  "its .gguf) and it is picked up as that model's drafter automatically.")
+        print()
+        return
+
+    # ---- structure from the tensor list
+    bc = A("block_count", 0)
+    nextn = A("nextn_predict_layers", 0) or 0
+    main_layers = bc - nextn
+    total = mtp_params = 0
+    active = 0
+    euc = A("expert_used_count")
+    type_elems = {}
+    for tname, dims, typ in tensors:
+        n = _prod(dims)
+        m = re.match(r"blk\.(\d+)\.", tname)
+        layer = int(m.group(1)) if m else None
+        if layer is not None and layer >= main_layers:
+            mtp_params += n
+            continue
+        total += n
+        type_elems[GGML_TYPES.get(typ, f"type{typ}")] = type_elems.get(GGML_TYPES.get(typ, f"type{typ}"), 0) + n
+        if "_exps" in tname and len(dims) >= 3 and layer is not None:
+            used = _per_layer(euc, layer, 0) if isinstance(euc, list) else (euc or dims[-1])
+            active += n * used / dims[-1]
+        else:
+            active += n
+    is_moe = bool(A("expert_count"))
+    file_bytes = sum(f.stat().st_size for f in ([main] if "-00001-of-" not in main.name
+                                                 else main.parent.glob(main.name.split("-00001-of-")[0] + "*")))
+    bpw = file_bytes * 8 / max(total + mtp_params, 1)
+
+    # ---- header
+    base = [kv.get(f"general.base_model.{i}.organization", "") + "/" + kv.get(f"general.base_model.{i}.name", "")
+            for i in range(kv.get("general.base_model.count", 0) or 0)]
+    out.title(name, f"{main.name}  ·  {gb(disk_size(path))} on disk")
+
+    # ---- identity
+    out.section("Identity")
+    family = next((f for k, f in FAMILIES if arch.startswith(k)), None)
+    out.trait("Architecture", f"{arch}" + (f"  ({family} family)" if family else ""),
+              "The model design llama.cpp loads it as. It decides the layer types, how memory grows with "
+              "context and which features (drafting, vision) exist; the sections below spell them out.")
+    if kv.get("general.size_label") or total:
+        label = kv.get("general.size_label")
+        out.trait("Parameters", _fmt_params(total) + (f"  (label: {label})" if label else ""),
+                  "The number of learned weights. More parameters generally means more knowledge and better "
+                  "reasoning, at the cost of memory and speed.",
+                  None if not is_moe else f"Mixture-of-experts: only about {_fmt_params(active)} of them work on "
+                  f"each token (see Mixture of experts), so it runs like a {_fmt_params(active)} model but "
+                  f"knows like a {_fmt_params(total)} one.")
+    if base:
+        ft = kv.get("general.finetune")
+        out.trait("Lineage", ", ".join(b.strip("/") for b in base) + (f"  (finetune: {ft})" if ft else ""),
+                  "The model these weights were derived from (fine-tuned, merged, distilled or quantized).",
+                  "Behaviour and licence mostly follow the base model; anything the derivative changed is on "
+                  "top of that.")
+    lic = kv.get("general.license.name") or kv.get("general.license")
+    if kv.get("general.quantized_by"):
+        out.trait("Quantized by", kv["general.quantized_by"] + (f"  ·  licence {lic}" if lic else ""))
+    elif lic:
+        out.trait("Licence", lic)
+    unc = [s for s in [name, kv.get("general.name", ""), " ".join(kv.get("general.tags") or [])] if UNCENSORED_RE.search(s)]
+    if unc:
+        ara = re.search(r"\bara\b", unc[0], re.I)
+        out.trait("Decensored", "yes" + ("  (Heretic ARA)" if ara else ""),
+                  "Refusal behaviour was removed after training by finding the internal 'refusal direction' and "
+                  "ablating it from the weights (abliteration; Heretic automates and tunes this). The model "
+                  "answers requests the original would decline.",
+                  ("ARA = Arbitrary-Rank Ablation, Heretic 2's method: removes a multi-dimensional refusal "
+                   "subspace while optimising to keep everything else unchanged. " if ara else "")
+                  + "Expect fewer refusals and slightly less built-in caution; general quality usually stays "
+                  "close to the original (check the card's KL divergence).", warn=True)
+
+    # ---- layers
+    out.section("Layers")
+    hk = A("attention.head_count_kv")
+    fai = A("full_attention_interval")
+    if isinstance(hk, list):
+        attn = {i for i in range(main_layers) if _per_layer(hk, i)}
+    elif fai:
+        attn = {i for i in range(main_layers) if (i + 1) % fai == 0}
+    else:
+        attn = set(range(main_layers))
+    pattern = A("attention.sliding_window_pattern")
+    swa = {i for i in attn if isinstance(pattern, list) and i < len(pattern) and pattern[i]}
+    if isinstance(euc, list):
+        moe_layers = {i for i in range(main_layers) if _per_layer(euc, i)}
+    elif is_moe:
+        moe_layers = set(range(A("leading_dense_block_count", 0) or 0, main_layers))
+    else:
+        moe_layers = set()
+    separate_blocks = bool(moe_layers) and not (attn & moe_layers)
+    other = set(range(main_layers)) - attn - (moe_layers if separate_blocks else set())
+    has_ssm = any(k.startswith(f"{arch}.ssm.") for k in kv)
+    has_conv = any(k.startswith(f"{arch}.shortconv.") for k in kv)
+    other_kind = ("state-space / linear-attention (recurrent)" if has_ssm else
+                  "short-convolution" if has_conv else "non-attention")
+    parts = [f"{len(attn)} attention" + (f" ({len(swa)} sliding-window, {len(attn) - len(swa)} global)" if swa else "")]
+    if other:
+        parts.append(f"{len(other)} {other_kind}")
+    if separate_blocks:
+        parts.append(f"{len(moe_layers)} MoE feed-forward")
+    here = None
+    if other:
+        here = (f"Hybrid: only {len(attn)} of {main_layers} layers use attention and keep a growing KV cache; the "
+                f"{len(other)} {other_kind} layers keep a fixed-size state instead. Long contexts cost far less "
+                "memory and slow down less than in a pure-attention model.")
+    elif swa:
+        here = (f"{len(swa)} layers only look back {A('attention.sliding_window')} tokens (sliding window), so "
+                "their KV cache stops growing; the global layers still see the whole context.")
+    else:
+        here = "Every layer is full attention: simple and strong, but memory grows with every token of context."
+    out.trait("Layer mix", f"{main_layers} layers: " + ", ".join(parts),
+              "Transformer layers mix information across tokens. Attention layers compare every token with every "
+              "earlier one (powerful, memory grows with context); recurrent / convolution layers carry a "
+              "compressed running state (cheap at any length).", here)
+    heads = A("attention.head_count")
+    kvh = _most_common_nonzero(hk)
+    if heads and kvh:
+        ratio = heads / kvh
+        out.trait("Attention heads", f"{heads} query heads, {kvh} key/value heads"
+                  + (f", head size {A('attention.key_length')}" if A("attention.key_length") else "")
+                  + (f" ({A('attention.key_length_swa')} in sliding-window layers)"
+                     if swa and A("attention.key_length_swa") not in (None, A("attention.key_length")) else ""),
+                  "Grouped-query attention (GQA) lets several query heads share one key/value head, shrinking the "
+                  "KV cache by that factor with little quality cost.",
+                  f"{ratio:.0f} query heads per KV head: the KV cache is {ratio:.0f}x smaller than without GQA."
+                  if ratio > 1 else "No sharing (multi-head attention): the largest possible KV cache per token.")
+
+    # ---- mixture of experts
+    if is_moe:
+        out.section("Mixture of experts")
+        n_exp = A("expert_count")
+        used = _most_common_nonzero(euc)
+        shared = A("expert_shared_count", 0) or 0
+        out.trait("Experts", f"{n_exp} experts, {used} used per token" + (f", {shared} shared" if shared else ""),
+                  "An MoE layer holds many small feed-forward 'experts' and a router picks a few for each token. "
+                  "Memory holds all of them; compute and bandwidth only touch the chosen ones.",
+                  f"Each token activates {used}/{n_exp} experts ({100 * used / n_exp:.1f}%), about "
+                  f"{_fmt_params(active)} of {_fmt_params(total)} weights, so generation speed is close to a "
+                  f"{_fmt_params(active)} dense model."
+                  + (f" {shared} always-on shared expert(s) hold common knowledge." if shared else ""))
+        if A("moe_latent_size"):
+            out.trait("Latent MoE", f"experts work in a {A('moe_latent_size')}-wide latent space "
+                      f"(model width {A('embedding_length')})",
+                      "Tokens are projected into a smaller space before routing to experts and back afterwards, so "
+                      "each expert is cheaper and more of them fit in the same budget.",
+                      "This is why the model can afford so many experts per layer.")
+        out.trait("Offloading", "experts can live in system RAM",
+                  "When an MoE model doesn't fit in VRAM, llama.cpp can keep attention and shared weights on the GPU "
+                  "and move some layers' experts to RAM (--n-cpu-moe; --fit does it automatically).",
+                  "The GPU keeps the always-used weights, so a partial offload costs much less speed than it "
+                  "would for a dense model.")
+
+    # ---- weights / quantization
+    out.section("Weights")
+    ftype = FILE_TYPES.get(kv.get("general.file_type"), None)
+    top = sorted(type_elems.items(), key=lambda x: -x[1])[:4]
+    mix = ", ".join(f"{t} {100 * n / max(total, 1):.0f}%" for t, n in top if n / max(total, 1) >= 0.005)
+    dominant, dom_share = (top[0][0], top[0][1] / max(total, 1)) if top else ("?", 0)
+    qname = ftype or dominant
+    label = qname
+    bit_class = lambda q: (re.match(r"[A-Z]+\d", q or "") or re.match(r".*", q or "")).group(0)  # noqa: E731
+    if ftype and dom_share > 0.5 and bit_class(ftype) != bit_class(dominant):
+        qname, label = dominant, f"mostly {dominant} (file tagged {ftype})"
+    in_name = QUANT_RE.findall(SPLIT_RE.sub("", main.stem))
+    from_name = in_name[-1].upper() if in_name else None
+    if from_name and from_name.removeprefix("UD-") not in (ftype, dominant):
+        label += f", sold as {from_name}"
+    ud = "UD-" in main.name or (kv.get("general.quantized_by") or "").lower() == "unsloth"
+    out.trait("Quantization", f"{label}  ·  {bpw:.2f} bits/weight  ·  mix: {mix}",
+              _quant_family(qname),
+              _quality_note(bpw, total)
+              + (" Unsloth Dynamic: each layer's precision was chosen separately from measurements, not one "
+                 "type for everything." if ud else "")
+              + (f" {kv['general.description']}." if kv.get("general.description") and "quant" in kv["general.description"].lower() else ""))
+    if kv.get("quantize.imatrix.file"):
+        out.trait("Importance matrix", f"{kv.get('quantize.imatrix.chunks_count', '?')} calibration chunks",
+                  "An imatrix records which weights matter most on sample text; the quantizer spends its precision "
+                  "on those. It matters most below ~4.5 bits per weight.",
+                  "Used for this file." + (" At this bit width it makes a real difference." if bpw < 4.5 else ""))
+
+    # ---- context and memory
+    out.section("Context and memory")
+    ctx_train = A("context_length", 0)
+    ctx = int(preset.get("ctx-size", 0) or 0) or ctx_train
+    ktype = preset.get("cache-type-k", "f16").lower()
+    vtype = preset.get("cache-type-v", "f16").lower()
+    kl, vl = A("attention.key_length"), A("attention.value_length")
+    if not kl and heads:
+        kl = vl = A("embedding_length", 0) // heads
+    kl_swa, vl_swa = A("attention.key_length_swa", kl), A("attention.value_length_swa", vl)
+    window = A("attention.sliding_window") or 0
+
+    def kv_bytes(tokens):
+        b = 0
+        for i in attn:
+            n_kv = _per_layer(hk, i) if isinstance(hk, list) else hk or 0
+            if i in swa:
+                t, k_, v_ = min(tokens, window or tokens), kl_swa or 0, vl_swa or 0
+            else:
+                t, k_, v_ = tokens, kl or 0, vl or 0
+            b += t * n_kv * (k_ * KV_BYTES.get(ktype, 2) + v_ * KV_BYTES.get(vtype, 2))
+        return b
+
+    if ctx_train:
+        out.trait("Context window", f"trained for {ctx_train:,} tokens; your preset uses {ctx:,}",
+                  "How much text (prompt + history + answer) the model can attend to at once. llama.cpp "
+                  "reserves memory for the configured size up front.",
+                  " ".join(x for x in (
+                      "Raise ctx-size in `llm edit` if you need more." if ctx < ctx_train else "",
+                      f"RoPE base {A('rope.freq_base'):,.0f}: a base this large is how long-context training "
+                      "is done." if (A("rope.freq_base") or 0) >= 1e6 else "",
+                      "Recurrent layers don't use positions at all, so most of the network is indifferent to "
+                      "length." if has_ssm and other else "") if x) or None)
+    if attn and kl:
+        per_tok = kv_bytes(1)
+        out.trait("KV cache", f"{gb(kv_bytes(ctx))} at {ctx:,} tokens ({ktype}/{vtype})"
+                  + (f"; {gb(kv_bytes(ctx_train))} at the full {ctx_train:,}" if ctx_train > ctx else ""),
+                  "Attention layers store a key and value vector per token per layer; that cache grows with "
+                  "context and sits in VRAM next to the weights. q8_0 cache types halve it with little loss.",
+                  f"About {per_tok / 1024:.0f} KB per token"
+                  + (" for the global layers; sliding-window layers stop growing at "
+                     f"{window:,} tokens" if swa else "")
+                  + (". The recurrent layers add only a small fixed state." if other and has_ssm else ".")
+                  + (" Set cache-type-k/v = q8_0 in `llm edit` to halve it." if ktype == "f16" and kv_bytes(ctx) > 2**30 else ""))
+
+    # ---- extras: drafting, vision, chat
+    out.section("Features")
+    pre_spec = preset.get("spec-type", "")
+    if nextn and not mtp_params:
+        out.trait("Speculative decoding", "MTP head listed but not included",
+                  "Some models ship a multi-token-prediction head for faster generation.",
+                  "The metadata mentions one, but this file has no weights for it (the quantizer dropped them), "
+                  "so built-in drafting isn't available with this download.", warn="mtp" in pre_spec)
+    if nextn and mtp_params:
+        out.trait("Speculative decoding", f"built-in MTP head ({nextn} layer, {_fmt_params(mtp_params)} params)",
+                  "Multi-token prediction: a small extra layer guesses the next few tokens and the main model "
+                  "checks them all in one pass. Same output, typically 1.5-2.5x faster generation.",
+                  "Enabled in your presets." if "mtp" in pre_spec else
+                  "Not enabled: add `spec-type = draft-mtp` under this model in `llm edit`.", warn="mtp" not in pre_spec)
+    for d in drafts:
+        try:
+            dkv, _ = read_gguf(d, tensors=False)
+        except (OSError, ValueError):
+            continue
+        darch = dkv.get("general.architecture", "?")
+        needs_mtp = darch.endswith("assistant") or darch.endswith("mtp")
+        broken = needs_mtp and "mtp" not in pre_spec
+        what = ("A separate small draft model proposes several tokens ahead and the main model verifies them in "
+                "one pass; accepted guesses are free speed, rejected ones cost little. Output is unchanged.")
+        if darch == "dflash":
+            here = (f"DFlash drafter: drafts up to {dkv.get('dflash.block_size', '?')} tokens at once from the main "
+                    f"model's hidden states (layers {dkv.get('dflash.target_layers', '?')}).")
+        else:
+            here = f"{darch} drafter ({dkv.get(f'{darch}.block_count', '?')} layers) reusing the main model's state."
+        if broken:
+            here += " It needs `spec-type = draft-mtp` in `llm edit`; without it the model fails to load."
+        elif pre_spec:
+            here += f" Preset: spec-type = {pre_spec}."
+        if preset.get("spec-draft-n-max"):
+            here += f" Drafts at most {preset['spec-draft-n-max']} tokens per step."
+        out.trait("Speculative decoding", f"{d.name}  ({gb(d.stat().st_size)})", what, here, warn=broken)
+    if mmproj:
+        try:
+            mkv, _ = read_gguf(mmproj, tensors=False)
+        except (OSError, ValueError):
+            mkv = {}
+        modes = [m for m, k in (("images", "clip.has_vision_encoder"), ("audio", "clip.has_audio_encoder")) if mkv.get(k)]
+        out.trait("Multimodal input", " + ".join(modes or ["yes"])
+                  + (f"  ({mkv.get('clip.vision.projector_type')} encoder"
+                     + (f", {mkv['clip.vision.block_count']} layers" if mkv.get("clip.vision.block_count") else "")
+                     + ")" if mkv.get("clip.vision.projector_type") else ""),
+                  "A separate encoder (the mmproj file) turns images/audio into tokens the language model reads.",
+                  f"Loaded automatically from {mmproj.name}; it adds {gb(mmproj.stat().st_size)} of VRAM. Send "
+                  "images through the web UI (`llm ui`) or OpenAI-style image_url messages.")
+    tmpl = kv.get("tokenizer.chat_template") or ""
+    feats = []
+    if any(k in tmpl for k in ("enable_thinking", "<think>", "reasoning_content", "<|channel|>")):
+        feats.append("thinking")
+    efforts = []
+    if "reasoning_effort" in tmpl:
+        efforts = [e for e in ("minimal", "low", "medium", "high", "xhigh", "max") if f"'{e}'" in tmpl or f'"{e}"' in tmpl]
+    if "tools" in tmpl and ("tool_call" in tmpl or "function" in tmpl):
+        feats.append("tool calling")
+    if feats:
+        here = []
+        if "thinking" in feats:
+            here.append("It writes a reasoning section before answering (returned as reasoning_content); "
+                        "turn it off per request with chat_template_kwargs {\"enable_thinking\": false} where the "
+                        "template supports it.")
+        if efforts:
+            here.append(f"Reasoning effort levels: {', '.join(efforts)}.")
+        if "tool calling" in feats:
+            here.append("Agent harnesses can give it tools (functions) to call.")
+        out.trait("Chat template", ", ".join(feats),
+                  "The template embedded in the GGUF formats conversations the way the model was trained on, "
+                  "including special modes.", " ".join(here))
+    samp = {k.split(".")[-1]: v for k, v in kv.items() if k.startswith("general.sampling.")}
+    if samp:
+        shown = ", ".join(f"{k} {v:.2f}".rstrip("0").rstrip(".") if isinstance(v, float) else f"{k} {v}"
+                          for k, v in samp.items())
+        mine = {k: preset[k] for k in ("temp", "top-p", "top-k", "min-p") if k in preset}
+        out.trait("Recommended sampling", shown,
+                  "Sampling settings the authors recommend: temperature (randomness), top-p / top-k / min-p "
+                  "(which candidate tokens are allowed).",
+                  ("Your preset overrides: " + ", ".join(f"{k} {v}" for k, v in mine.items()) + ".") if mine else
+                  "llama.cpp applies these by default; clients can still override them per request.")
+
+    # ---- this machine
+    out.section("On this machine")
+    gpu, vram = _gpu()
+    weights = file_bytes + (mmproj.stat().st_size if mmproj else 0) + sum(d.stat().st_size for d in drafts)
+    need = weights + (kv_bytes(ctx) if attn and kl else 0) + 0.8 * 2**30  # + compute buffers
+    if vram:
+        room = vram - 1.0 * 2**30  # desktop + driver
+        if need <= room:
+            verdict, here = "fits on the GPU", (f"Needs about {gb(need)} of {gb(vram)}: weights, KV cache and "
+                                                "buffers all stay in VRAM, so it runs at full speed.")
+        elif need - room < 0.75 * 2**30:
+            verdict = "tight fit"
+            here = (f"Needs about {gb(need)} of {gb(vram)}. llama.cpp's --fit trims buffers or moves a sliver "
+                    "to RAM; speed stays close to full. q8_0 KV cache (`llm edit`) gives it room to spare.")
+        else:
+            spill = need - room
+            verdict = f"~{gb(spill)} spills to system RAM"
+            here = (f"Needs about {gb(need)}; {gb(vram)} VRAM leaves ~{gb(spill)} for RAM. "
+                    + ("As an MoE model it can put expert weights there, which costs some speed but stays usable."
+                       if is_moe else "Dense layers in RAM run several times slower; a smaller quant or "
+                       "shorter context would let it fit."))
+        out.trait("Fit", f"{verdict}  ({gpu})",
+                  "Everything the model touches per token should sit in VRAM; whatever doesn't fit runs from "
+                  "system RAM at a fraction of the bandwidth.", here, warn=need - room >= 0.75 * 2**30)
+    srv = server_models(reload=False)
+    if srv is not None:
+        st = next((m["status"]["value"] for m in srv if m["id"] == name), "unknown")
+        overrides = {k: v for k, v in preset.items() if k not in _preset("__defaults_only__")}
+        out.trait("Server", st + (f"  ·  preset: " + ", ".join(f"{k}={v}" for k, v in overrides.items())
+                                  if overrides else ""))
+    print()
+
+
 # ---------------------------------------------------------------- commands
 def cmd_search(args):
     if not args:
@@ -750,6 +1339,8 @@ llm — Hugging Face GGUF models served by llama.cpp (router at {SERVER})
   llm pull <user/repo>[:QUANT]    download (picker if no QUANT; adds vision mmproj)
         [--name NAME] [--no-mmproj]
   llm ls                          local models + loaded/unloaded status
+  llm info <model>                what a model is: architecture, MoE, quantization,
+                                  context/KV memory, drafting, vision, fit on your GPU
   llm rm <model> [-y]             delete a model
   llm unload [model]              free VRAM now (default: all loaded)
 
@@ -773,7 +1364,7 @@ downloads there too and shows up automatically. Point any OpenAI client at
 
 COMMANDS = {
     "search": cmd_search, "quants": cmd_quants, "pull": cmd_pull, "ls": cmd_ls,
-    "list": cmd_ls, "rm": cmd_rm, "unload": cmd_unload, "serve": cmd_serve,
+    "list": cmd_ls, "info": cmd_info, "rm": cmd_rm, "unload": cmd_unload, "serve": cmd_serve,
     "start": cmd_serve, "stop": cmd_stop, "restart": cmd_restart,
     "status": cmd_status, "logs": cmd_logs, "ui": cmd_ui, "edit": cmd_edit,
     "fit": cmd_fit, "sandbox": cmd_sandbox, "setup": cmd_setup, "key": cmd_key, "reload": cmd_reload, "uninstall": cmd_uninstall,
