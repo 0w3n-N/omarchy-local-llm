@@ -18,8 +18,8 @@ import qs.Commons as Commons
 //
 // Upper triangle — the half a causal mask hides, used as a VRAM gauge: the
 // share of the card the model is holding. It fills outward from the diagonal
-// to the far corner, its cells splitting the card evenly (6 on a 4x4 grid, so
-// ~2.7 GB each on 16 GB; a partial cell is drawn smaller), and drains when the
+// to the far corner, its cells splitting the card evenly (6 on a 4x4 grid, each
+// a sixth of the card; a partial cell is drawn smaller), and drains when the
 // model sleeps or unloads. Each cell has its own colour on a low -> mid -> high
 // gradient in fill order, so the colour at the tip says how full the card is
 // as well as the count does. A soft glow travels through the filled cells now
