@@ -10,11 +10,13 @@ keeps one in VRAM at a time, and sleeps idle models (see presets.ini).
 Part of https://github.com/0w3n-N/omarchy-local-llm (MIT).
 """
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -1360,6 +1362,10 @@ def cmd_reload(args):
         reload_server()
     except OSError:
         pass   # server down: it rescans on start anyway
+    try:
+        rank_models(write=True)  # the panel's order follows models being added or removed
+    except Exception as e:  # never fail the reload unit over the ranking
+        print(f"lllm: ranking not updated: {e}", file=sys.stderr)
 
 
 def cmd_uninstall(args):
@@ -1379,6 +1385,255 @@ def cmd_uninstall(args):
     remove_completion()
     print(f"\nKept your models ({MODELS}) and settings ({CONF_DIR}, including any API key).")
     print("Delete those two paths by hand if you want the disk space back.")
+
+
+# ---------------------------------------------------------------- ranking
+# The panel lists models best-first. `lllm bench` measures a model (generation
+# speed + a short reasoning quiz); a model without a measurement is estimated from
+# its GGUF header (size, active parameters, quantization, fit on this GPU).
+# `lllm rank` shows the order; `lllm reload` (run on every model or preset change)
+# rewrites RANK_FILE, which the panel watches.
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "local-llm"
+BENCH_FILE = DATA_DIR / "bench.json"
+RANK_FILE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "local-llm/rank.json"
+QUIZ = [
+    ("The sum of the first 2011 terms of a geometric sequence is 200. The sum of the first 4022 terms is 380. "
+     "Find the sum of the first 6033 terms.", "542"),
+    ("In how many ways can 8 non-attacking rooks be placed on an 8x8 chessboard so that no rook is on the "
+     "main diagonal?", "14833"),
+    ("How many ordered pairs of positive integers (x, y) satisfy 1/x + 1/y = 1/12?", "15"),
+    ("How many subsets of {1, 2, ..., 10} (including the empty set) contain no two consecutive integers?", "144"),
+]
+QUIZ_SUFFIX = "\n\nThink it through, then end your reply with a final line of the form `ANSWER: <number>`."
+QUIZ_MAX_TOKENS = 6000
+QUALITY_WEIGHT = 0.65  # the rest is speed: a strong, slower model beats a fast, weak one
+
+
+def _clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
+
+
+def quiz_answer(text):
+    """The number a reply settles on: `ANSWER: n`, else the last \\boxed{n}, else a bare final line."""
+    t = text.replace(",", "").replace("$", "")
+    for pat in (r"ANSWER\s*[:：]\s*\**\s*\\?(?:boxed\{)?\s*(-?\d+)", r"\\boxed\{\s*(-?\d+)\s*\}"):
+        m = re.findall(pat, t, re.I)
+        if m:
+            return m[-1]
+    lines = [ln.strip(" *.`") for ln in t.strip().splitlines() if ln.strip()]
+    return lines[-1] if lines and re.fullmatch(r"-?\d+", lines[-1]) else None
+
+
+def load_bench():
+    try:
+        data = json.loads(BENCH_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_bench(data):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = BENCH_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
+    os.replace(tmp, BENCH_FILE)
+
+
+def model_profile(path):
+    """Size facts for ranking, from the GGUF header (None for drafter sidecars / unreadable files)."""
+    try:
+        main, mmproj, drafts = _model_files(path)
+        kv, tensors = read_gguf(main)
+    except (OSError, ValueError, KeyError):
+        return None
+    arch = kv.get("general.architecture", "?")
+    if arch == "dflash" or arch.endswith(("-assistant", "_assistant")) or main.name.startswith(("mtp-", "dflash-", "dspark-")):
+        return None
+    main_layers = kv.get(f"{arch}.block_count", 0) - (kv.get(f"{arch}.nextn_predict_layers", 0) or 0)
+    euc = kv.get(f"{arch}.expert_used_count")
+    total = active = lookup = 0
+    types = {}
+    for tname, dims, typ in tensors:
+        n = _prod(dims)
+        m = re.match(r"blk\.(\d+)\.", tname)
+        layer = int(m.group(1)) if m else None
+        if layer is not None and layer >= main_layers:
+            continue  # built-in MTP layer: drafting only
+        total += n
+        types[typ] = types.get(typ, 0) + n
+        if tname.startswith(("token_embd.", "per_layer_token_embd.")):
+            lookup += n  # embedding tables: a few rows are looked up per token, never read whole
+        if "_exps" in tname and len(dims) >= 3 and layer is not None:
+            used = _per_layer(euc, layer, 0) if isinstance(euc, list) else (euc or dims[-1])
+            active += n * used / dims[-1]
+        else:
+            active += n
+    if not total:
+        return None
+    shards = sorted(main.parent.glob(main.name.split("-00001-of-")[0] + "-0*-of-*.gguf")) if "-00001-of-" in main.name else [main]
+    weights_file = sum(f.stat().st_size for f in shards)
+    extras = (mmproj.stat().st_size if mmproj else 0) + sum(d.stat().st_size for d in drafts)
+    dominant = GGML_TYPES.get(max(types, key=types.get), "")
+    return {"total": total, "active": active, "lookup": lookup, "read_per_token": max(active - lookup, 0.05 * total),
+            "bpw": weights_file * 8 / total, "moe": active < 0.9 * total,
+            "file_bytes": weights_file, "extra_bytes": extras, "low_bit_native": dominant in ("TQ1_0", "TQ2_0", "Q1_0", "Q2_0")}
+
+
+def model_score(prof, bench, vram):
+    """(score 0-100, details) from a profile and an optional measurement."""
+    # size prior on the weights that do the work (embedding tables excluded); MoE counts
+    # as the geometric mean of total and active, the usual rule of thumb
+    body_total = max(prof["total"] - prof["lookup"], 1)
+    body_active = max(prof["active"] - prof["lookup"], 1)
+    eff = (body_total * body_active) ** 0.5 if prof["moe"] else body_total
+    q_est = _clamp((math.log10(eff / 1e9) + 0.3) / 2.1)  # ~0.5B -> 0, ~60B -> 1
+    bpw = prof["bpw"]
+    q_est *= 1.0 if bpw >= 5 else 0.97 if bpw >= 4 else 0.92 if bpw >= 3 else 0.95 if prof["low_bit_native"] else 0.85
+    detail = {"measured": False}
+    if bench and bench.get("quiz_n"):
+        # a 4-question quiz can show that a model is broken or weak at reasoning, not
+        # that a small model is as good as a big one: misses lower the size prior
+        frac = bench["quiz_ok"] / bench["quiz_n"]
+        quality = q_est * (0.4 + 0.6 * frac)
+        detail.update(measured=True, quiz=f"{bench['quiz_ok']}/{bench['quiz_n']}")
+    else:
+        quality = q_est
+    if bench and bench.get("gen_tps"):
+        tps = bench["gen_tps"]
+        detail["tps"] = round(tps)
+    else:
+        # bandwidth-bound decode: bytes read per token over effective VRAM (~650 GB/s on
+        # current GPUs) and, for whatever doesn't fit, system RAM (~60 GB/s) bandwidth
+        per_token = prof["file_bytes"] * prof["read_per_token"] / prof["total"]
+        room = (vram - 2.5 * 2**30 - prof["extra_bytes"]) if vram else prof["file_bytes"]  # desktop, KV, buffers
+        in_ram = _clamp((prof["file_bytes"] - room) / prof["file_bytes"]) if vram else 0
+        tps = 1 / (per_token * (1 - in_ram) / 650e9 + per_token * in_ram / 60e9)
+        detail["tps_est"] = round(tps)
+    speed = _clamp(math.log(max(tps, 1) / 5) / math.log(24))  # 5 tok/s -> 0, 120+ tok/s (faster than reading) -> 1
+    score = 100 * (QUALITY_WEIGHT * quality + (1 - QUALITY_WEIGHT) * speed)
+    if bench and bench.get("error"):
+        score *= 0.2
+        detail["failed"] = True
+    return round(score), detail
+
+
+def rank_models(write=True):
+    """[(name, score, detail)] best-first; also writes RANK_FILE for the panel."""
+    bench = load_bench()
+    vram = vram_gb() * 2**30
+    ranked, skipped = [], []
+    for name, path in local_models().items():
+        prof = model_profile(path)
+        if prof is None:
+            skipped.append(name)
+            continue
+        score, detail = model_score(prof, bench.get(name), vram)
+        ranked.append((name, score, detail))
+    ranked.sort(key=lambda r: -r[1])
+    if write:
+        out = {"version": 1, "generated": int(time.time()),
+               "models": {n: dict(d, score=s) for n, s, d in ranked},
+               "unranked": skipped}
+        try:
+            RANK_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = RANK_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(out))
+            os.replace(tmp, RANK_FILE)  # the panel never reads a half-written file
+        except OSError:
+            pass
+    return ranked, skipped
+
+
+def cmd_rank(args):
+    ranked, skipped = rank_models(write=True)
+    if "--json" in args:
+        print(RANK_FILE.read_text() if RANK_FILE.exists() else "{}")
+        return
+    if not ranked:
+        print("no models to rank (lllm ls)")
+        return
+    w = max(len(n) for n, _, _ in ranked)
+    print(f"{'#':>2}  {'SCORE':>5}  {'MODEL':<{w}}  BASIS")
+    for i, (n, s, d) in enumerate(ranked, 1):
+        if d.get("failed"):
+            basis = "failed to load in its last benchmark"
+        elif d["measured"]:
+            basis = f"measured: quiz {d['quiz']}, {d['tps']} tok/s"
+        else:
+            basis = f"estimated from the file (~{d['tps_est']} tok/s); `lllm bench {n}` measures it"
+        print(f"{i:>2}  {s:>5}  {n:<{w}}  {basis}")
+    for n in skipped:
+        print(f" -      -  {n:<{w}}  not a chat model (drafter sidecar or unreadable)")
+    print(f"\nScore = {int(QUALITY_WEIGHT * 100)}% quality + {100 - int(QUALITY_WEIGHT * 100)}% speed. "
+          "The panel lists models in this order.")
+
+
+def _chat(model, prompt, max_tokens, thinking, timeout=1800):
+    return api("/v1/chat/completions", {
+        "model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens,
+        "temperature": 0.6, "top_p": 0.95, "seed": 42, "chat_template_kwargs": {"enable_thinking": thinking},
+    }, timeout=timeout)
+
+
+def bench_one(name, say=print):
+    for m in server_models(reload=False) or []:
+        if m["status"]["value"] in ("loaded", "loading", "sleeping"):
+            unload(m["id"])
+    time.sleep(2)
+    t0 = time.time()
+    try:
+        say("  loading…")
+        _chat(name, "Say hi.", 8, False, timeout=900)
+        load_s = time.time() - t0
+        say("  speed test…")
+        r = _chat(name, "Write a vivid 400-word short story about a lighthouse keeper who finds a message in a bottle.",
+                  400, False)
+        t = r.get("timings", {})
+        res = {"gen_tps": round(t.get("predicted_per_second", 0), 1), "load_s": round(load_s, 1)}
+        if t.get("draft_n"):
+            res["draft_accept"] = round(t.get("draft_n_accepted", 0) / t["draft_n"], 2)
+        ok = think = 0
+        for i, (q, want) in enumerate(QUIZ, 1):
+            say(f"  quiz {i}/{len(QUIZ)}…")
+            r = _chat(name, q + QUIZ_SUFFIX, QUIZ_MAX_TOKENS, True)
+            ok += quiz_answer(r["choices"][0]["message"].get("content") or "") == want
+            think += r.get("timings", {}).get("predicted_n", 0)
+        res.update(quiz_ok=ok, quiz_n=len(QUIZ), think_tokens=think // len(QUIZ))
+    except urllib.error.HTTPError as e:
+        res = {"error": f"HTTP {e.code}: {e.read().decode(errors='replace')[:200]}"}
+    except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
+        res = {"error": f"{e.__class__.__name__}: {e}"}
+    res["date"] = time.strftime("%Y-%m-%d")
+    return res
+
+
+def cmd_bench(args):
+    yes = "-y" in args
+    names = [a for a in args if not a.startswith("-")]
+    if "--all" in args:
+        names = [n for n, p in local_models().items() if model_profile(p) is not None]
+    if not names:
+        die("usage: lllm bench <model…> | --all [-y]   (speed + a 4-question reasoning quiz per model)")
+    names = [resolve_local(n)[0] for n in names]
+    if server_models(reload=False) is None:
+        die("the server isn't running — lllm serve")
+    if not yes and sys.stdin.isatty() and not confirm(
+            f"Benchmark {len(names)} model(s)? Each is loaded in turn (unloading whatever is loaded) and takes "
+            "about 1-10 minutes."):
+        die("aborted")
+    data = load_bench()
+    for i, n in enumerate(names, 1):
+        print(f"[{i}/{len(names)}] {n}")
+        data[n] = bench_one(n)
+        save_bench(data)
+        r = data[n]
+        print("  " + (r["error"] if "error" in r else
+                      f"{r['gen_tps']} tok/s, quiz {r['quiz_ok']}/{r['quiz_n']}, ~{r['think_tokens']} thinking tokens/question"))
+    for m in server_models(reload=False) or []:
+        if m["status"]["value"] in ("loaded", "sleeping"):
+            unload(m["id"])
+    print()
+    cmd_rank([])
 
 
 # ---------------------------------------------------------------- tab completion
@@ -1439,6 +1694,10 @@ def completions(words, cword):
     if cmd == "info":
         flags = [f for f in ("--color", "--no-color") if f not in rest]
         return flags + ([] if any(a in models for a in rest) else models)
+    if cmd == "bench":
+        return [f for f in ("--all", "-y") if f not in rest] + [m for m in models if m not in rest]
+    if cmd == "rank":
+        return [] if rest else ["--json"]
     if cmd == "rm":
         return (["-y"] if "-y" not in rest else []) + ([] if any(a in models for a in rest) else models)
     if cmd == "unload":
@@ -1527,6 +1786,8 @@ lllm — Hugging Face GGUF models served by llama.cpp (router at {SERVER})
   lllm ls                         local models + loaded/unloaded status
   lllm info <model>               what a model is: architecture, MoE, quantization,
                                   context/KV memory, drafting, vision, fit on your GPU
+  lllm rank                       models best-first (the panel's order), measured or estimated
+  lllm bench <model…>|--all       measure speed + a 4-question reasoning quiz (feeds rank)
   lllm rm <model> [-y]            delete a model
   lllm unload [model]             free VRAM now (default: all loaded)
 
@@ -1555,7 +1816,7 @@ COMMANDS = {
     "start": cmd_serve, "stop": cmd_stop, "restart": cmd_restart,
     "status": cmd_status, "logs": cmd_logs, "ui": cmd_ui, "edit": cmd_edit,
     "fit": cmd_fit, "sandbox": cmd_sandbox, "setup": cmd_setup, "key": cmd_key, "reload": cmd_reload, "uninstall": cmd_uninstall,
-    "completion": cmd_completion, "__complete": cmd_complete,
+    "completion": cmd_completion, "__complete": cmd_complete, "bench": cmd_bench, "rank": cmd_rank,
 }
 
 

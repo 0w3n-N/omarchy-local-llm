@@ -35,7 +35,8 @@
     "defaultSection": "right",
     "defaults": {
       "port": 8080,
-      "refreshIntervalSec": 5
+      "refreshIntervalSec": 5,
+      "modelOrder": "score"
     },
     "schema": [
       {
@@ -55,6 +56,22 @@
         "max": 300,
         "step": 1,
         "defaultValue": 5
+      },
+      {
+        "key": "modelOrder",
+        "type": "enum",
+        "label": "Model list order",
+        "options": [
+          {
+            "value": "score",
+            "label": "Best first (lllm rank)"
+          },
+          {
+            "value": "server",
+            "label": "Server order"
+          }
+        ],
+        "defaultValue": "score"
       }
     ]
   }

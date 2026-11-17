@@ -127,6 +127,10 @@ Panel {
     var parts = [strings.t("status." + st)]
     if (st === "loaded" && llm.vramMiB >= 0)
       parts[0] = strings.t("status.loadedVram").arg(gib(llm.vramMiB))
+    var r = llm.rankOf(m)
+    if (r) parts.push(r.failed ? strings.t("rank.failed")
+      : r.measured ? (r.tps >= 0 ? strings.t("rank.measured").arg(r.score).arg(r.tps).arg(r.quiz) : strings.t("rank.score").arg(r.score))
+      : strings.t("rank.estimated").arg(r.score))
     if (m.vision) parts.push(strings.t("model.vision"))
     if (m.aliases.length > 0) parts.push(strings.t("model.alias").arg(m.aliases.join(", ")))
     return parts.join(" · ")

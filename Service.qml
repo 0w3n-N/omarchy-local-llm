@@ -30,6 +30,11 @@ Item {
   property bool installed: true
   // The CLI ships with the plugin; run it from here so it works without PATH changes.
   readonly property string cliPath: String(Qt.resolvedUrl("bin/lllm")).replace(/^file:\/\//, "")
+  // Best-first order from `lllm rank` (rewritten by `lllm reload` whenever models
+  // or presets change, and by `lllm bench`). Values are only numbers we check.
+  readonly property string rankPath: (Quickshell.env("XDG_CACHE_HOME") || Quickshell.env("HOME") + "/.cache") + "/local-llm/rank.json"
+  readonly property bool sortByScore: setting("modelOrder", "score") !== "server"
+  property var rank: ({})          // { id: { score, measured, tps, quiz } }
   property var models: []          // [{ id, status, vision, aliases }]
   property int vramMiB: -1         // llama-server VRAM, -1 = unknown
   property int gpuUsedMiB: 0       // whole GPU, every process
@@ -119,6 +124,39 @@ Item {
     pollProcess.running = true
   }
 
+  function parseRank(raw) {
+    var parsed
+    try { parsed = JSON.parse(raw) } catch (e) { return ({}) }
+    var src = parsed && typeof parsed.models === "object" && parsed.models !== null ? parsed.models : {}
+    var out = ({})
+    var n = 0
+    for (var id in src) {
+      var r = src[id]
+      if (!r || typeof r.score !== "number" || !isFinite(r.score) || id.length > 200 || ++n > 500) continue
+      out[id] = {
+        score: Math.max(0, Math.min(100, Math.round(r.score))),
+        measured: r.measured === true,
+        failed: r.failed === true,
+        tps: typeof r.tps === "number" && isFinite(r.tps) ? Math.round(r.tps) : -1,
+        quiz: typeof r.quiz === "string" && /^\d{1,2}\/\d{1,2}$/.test(r.quiz) ? r.quiz : ""
+      }
+    }
+    return out
+  }
+
+  function rankOf(m) { return m && rank.hasOwnProperty(m.id) ? rank[m.id] : null }
+
+  // Best score first; models without a score keep the server's order, after the scored ones.
+  function sorted(list) {
+    if (!sortByScore) return list
+    var keyed = list.map(function(m, i) { var r = rankOf(m); return { m: m, i: i, s: r ? r.score : -1 } })
+    keyed.sort(function(a, b) { return b.s - a.s || a.i - b.i })
+    return keyed.map(function(k) { return k.m })
+  }
+
+  onSortByScoreChanged: models = sorted(models)
+  onRankChanged: models = sorted(models)
+
   function applyModels(list) {
     // Drop optimistic entries once the server agrees (or the model vanished).
     var next = ({})
@@ -132,7 +170,7 @@ Item {
       if (!done && m.status !== "failed") next[id] = pending[id]
     }
     pending = next
-    models = list
+    models = sorted(list)
   }
 
   function post(path, modelId) {
@@ -203,6 +241,16 @@ Item {
     onFileChanged: reload()
     onLoaded: { root.authRequired = text().indexOf("Authorization:") === 0; root.refresh(false) }
     onLoadFailed: { root.authRequired = false; root.refresh(false) }
+  }
+
+  FileView {
+    id: rankView
+    path: root.rankPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.rank = root.parseRank(String(text() || ""))
+    onLoadFailed: root.rank = ({})
   }
 
   Timer {

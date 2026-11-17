@@ -61,9 +61,12 @@ lllm pull                         interactive: search, pick repo, pick quant
 lllm pull <user/repo>[:QUANT]     download directly
 lllm ls | rm <model> | unload     list, delete, free VRAM now
 lllm info <model>                 explain a model: layers, experts, quantization, memory, fit
+lllm rank | bench <model…>        order models best-first; measure speed + a short quiz
 lllm serve | stop | restart | status | logs
 lllm edit                         per-model settings
 ```
+
+The panel lists your models best-first. `lllm bench <model>` (or `--all`) loads each model and measures its generation speed and its answers to a 4-question math quiz; models you haven't benchmarked get an estimate from their file (size, active parameters, quantization, and whether they fit in VRAM). The score is 65% quality and 35% speed, so a strong model that's somewhat slower still ranks above a fast, weak one. `lllm rank` shows the order and where each number came from; the panel shows the score under each model (`~` = estimated) and re-sorts whenever models or presets change. To keep the server's order instead, set "Model list order" in the widget's settings. Measurements are kept in `~/.local/share/local-llm/bench.json`, the ranking in `~/.cache/local-llm/rank.json`.
 
 Tab completes every `lllm` command, subcommand and flag in bash, including your model names (`lllm info <Tab>`), the sandbox's commands and settings, and llmfit's own subcommands under `lllm fit`. Setup installs it to `~/.local/share/bash-completion/completions/` (needs the `bash-completion` package, which Omarchy ships); on an install from before 1.3.1, run `lllm completion install` once.
 
