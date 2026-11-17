@@ -48,8 +48,18 @@ Panel {
     var v = String(value || "")
     return /^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/.test(v) ? v : fallback
   }
+  // Gradient low -> mid -> high (cyan -> green -> yellow on most themes). The
+  // high end is also the "card nearly full" colour: yellow stands out on pink
+  // and purple themes where red blends in.
   readonly property color gaugeColor: hexOr(themeScope.ch2, hexOr(themeColors.cyan, hexOr(themeColors.blue, Commons.Color.accent)))
-  readonly property color warnColor: hexOr(themeScope.red, hexOr(themeColors.red, Commons.Color.urgent))
+  readonly property color gaugeMid: hexOr(themeColors.green, hexOr(themeScope.ch3, gaugeColor))
+  readonly property color warnColor: hexOr(themeScope.ch4, hexOr(themeColors.yellow, hexOr(themeScope.orange, hexOr(themeColors.orange, Commons.Color.urgent))))
+  // The gauge colour for a share of VRAM (what the icon's tip shows).
+  function vramColor(frac) {
+    var f = Math.max(0, Math.min(1, frac))
+    var a = f < 0.5 ? gaugeColor : gaugeMid, b = f < 0.5 ? gaugeMid : warnColor, t = f < 0.5 ? f * 2 : (f - 0.5) * 2
+    return Qt.rgba(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, 1)
+  }
 
   function parseScope(text) {
     try {
@@ -258,8 +268,9 @@ Panel {
           y: (parent.height - height) / 2
           iconSize: button.iconSize
           color: root.barForeground
-          gaugeColor: root.gaugeColor
-          warnColor: root.warnColor
+          gaugeLow: root.gaugeColor
+          gaugeMid: root.gaugeMid
+          gaugeHigh: root.warnColor
           gauge: llm.vramFraction
           warn: llm.gpuNearlyFull
           mode: root.iconMode
@@ -345,8 +356,9 @@ Panel {
                   iconSize: Style.font.display
                   grid: 5
                   color: root.foreground
-                  gaugeColor: root.gaugeColor
-                  warnColor: root.warnColor
+                  gaugeLow: root.gaugeColor
+                  gaugeMid: root.gaugeMid
+                  gaugeHigh: root.warnColor
                   gauge: llm.vramFraction
                   warn: llm.gpuNearlyFull
                   mode: root.iconMode
@@ -396,7 +408,7 @@ Panel {
               visible: llm.vramMiB >= 0 && llm.gpuTotalMiB > 0
               label: strings.t("info.vram")
               value: strings.t("info.vramValue").arg(root.gib(llm.vramMiB)).arg(root.gib(llm.gpuTotalMiB))
-              valueColor: llm.gpuNearlyFull ? root.warnColor : root.gaugeColor
+              valueColor: llm.gpuNearlyFull ? root.warnColor : root.vramColor(llm.vramFraction)
             }
 
             // Legend for the icon's two halves, drawn with the same triangles.
@@ -412,7 +424,7 @@ Panel {
               }
               Row {
                 spacing: Style.space(5)
-                Text { textFormat: Text.PlainText; text: "◥"; color: llm.gpuNearlyFull ? root.warnColor : root.gaugeColor; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+                Text { textFormat: Text.PlainText; text: "◥"; color: llm.gpuNearlyFull ? root.warnColor : root.vramColor(llm.vramFraction); font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
                 Text { textFormat: Text.PlainText; text: strings.t("legend.vram"); color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter }
               }
             }

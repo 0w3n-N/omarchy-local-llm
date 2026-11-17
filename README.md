@@ -16,9 +16,9 @@ The bar icon is a small matrix split on its diagonal.
 | Part | Shows | States |
 |---|---|---|
 | Lower triangle (bar color) | What the model is doing, drawn as a transformer's causal attention mask | faint dots: server stopped · diagonal only: idle · cells filling: loading · full triangle: ready · shrunken points: asleep · a row walking down with flickering cells: generating |
-| Upper triangle (second theme color) | How much of your GPU memory the model holds | fills outward from the diagonal; turns red when the whole card is over 92% full |
+| Upper triangle (theme gradient) | How much of your GPU memory the model holds | fills outward from the diagonal, each cell a fixed share of the card (a partly used cell is drawn smaller); cells run low → mid → high colors in fill order, so the color at the tip shows the level too; a soft glow passes through the filled cells now and then and sweeps to the new level when it changes; every filled cell takes the high color, and the glow quickens, when the whole card is over 92% full |
 
-The second color is `ch2` from the theme's `scope.json` if it ships one, otherwise the theme's cyan, then blue, then accent.
+The gradient comes from the theme: low = `ch2` from its `scope.json` (else cyan, blue, accent), mid = green (else `ch3`), high = `ch4` (else yellow, then orange). The high end is deliberately not red, which blends into pink and purple themes. With animations turned off, the glow doesn't run.
 
 Left-click opens the panel, right-click unloads the loaded model, middle-click opens the llama.cpp web UI.
 

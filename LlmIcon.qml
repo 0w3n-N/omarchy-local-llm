@@ -16,12 +16,16 @@ import qs.Commons as Commons
 //              attention weights flickering, rows above settled, rows below
 //              still masked
 //
-// Upper triangle, second colour — the half a causal mask hides, used as a VRAM
-// gauge: the share of the card the model is holding. It fills outward from the
-// diagonal to the far corner, its cells splitting the card evenly (6 on a
-// 4x4 grid, so ~2.7 GB each on 16 GB; partial cells grow),
-// drains when the model sleeps or unloads, and turns to the warning colour
-// when the whole card is nearly full.
+// Upper triangle — the half a causal mask hides, used as a VRAM gauge: the
+// share of the card the model is holding. It fills outward from the diagonal
+// to the far corner, its cells splitting the card evenly (6 on a 4x4 grid, so
+// ~2.7 GB each on 16 GB; a partial cell is drawn smaller), and drains when the
+// model sleeps or unloads. Each cell has its own colour on a low -> mid -> high
+// gradient in fill order, so the colour at the tip says how full the card is
+// as well as the count does. A soft glow travels through the filled cells now
+// and then (and sweeps to the new level when it changes) without ever dimming
+// them, so the amount stays readable. When the whole card is nearly full,
+// every filled cell takes the high colour and the glow quickens.
 Item {
   id: root
 
@@ -29,10 +33,12 @@ Item {
   property color color: Commons.Color.foreground
   property string mode: "ready"
   property int grid: 4
-  property color gaugeColor: Commons.Color.accent
-  property color warnColor: Commons.Color.urgent
+  property color gaugeLow: Commons.Color.accent      // first cell
+  property color gaugeMid: gaugeLow                   // middle of the gradient
+  property color gaugeHigh: Commons.Color.urgent      // far corner, and the "card nearly full" colour
   property real gauge: 0          // 0..1 share of VRAM held by the model
   property bool warn: false       // whole GPU nearly full
+  property real wave: -1          // glow position, 0..1 while a sweep runs
 
   readonly property real aspectRatio: 1.0
   // With animations off Style.duration() is 0: show still frames, never loop.
@@ -74,12 +80,37 @@ Item {
     return (d - 1) * grid - (d - 1) * d / 2 + r
   }
 
+  function mix(a, b, t) {
+    return Qt.rgba(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, 1)
+  }
+
+  // Gradient colour for a fill position 0..1 (low -> mid -> high).
+  function gradientAt(t) {
+    return t < 0.5 ? mix(gaugeLow, gaugeMid, t * 2) : mix(gaugeMid, gaugeHigh, (t - 0.5) * 2)
+  }
+
+  // 0..1 glow on the i-th filled cell while a sweep passes over it.
+  function glowAt(i) {
+    var filled = gauge * upperCount
+    if (wave < 0 || i >= filled) return 0
+    var pos = wave * (filled + 1.5) - 0.75
+    return Math.max(0, 1 - Math.abs(i + 0.5 - pos) / 0.9)
+  }
+
+  function gaugeCellColor(r, c) {
+    var i = upperIndex(r, c)
+    var base = warn ? gaugeHigh : gradientAt(upperCount > 1 ? i / (upperCount - 1) : 1)
+    return mix(base, Qt.rgba(1, 1, 1, 1), 0.5 * glowAt(i))
+  }
+
   // [opacity, scale] for an upper (gauge) cell.
   function gaugeLook(r, c) {
     if (mode === "stopped") return [0.16, 0.3]
-    var amount = Math.max(0, Math.min(1, gauge * upperCount - upperIndex(r, c)))
+    var i = upperIndex(r, c)
+    var amount = Math.max(0, Math.min(1, gauge * upperCount - i))
     if (amount <= 0.02) return [0.22, 0.3]
-    return [0.45 + 0.55 * amount, 0.45 + 0.55 * amount]
+    // filled cells stay bright (the count is the reading); a partial one is smaller
+    return [Math.min(1, 0.72 + 0.28 * amount + 0.2 * glowAt(i)), 0.45 + 0.55 * amount]
   }
 
   // [opacity, scale] for one cell in the current mode/step.
@@ -104,6 +135,21 @@ Item {
   }
 
   onModeChanged: { step = 0; if (mode === "thinking") rerollRow(0) }
+
+  // The glow: one sweep through the filled cells, then a rest. It runs only
+  // while something is in VRAM and animations are on.
+  SequentialAnimation {
+    id: sweep
+    running: root.animate && root.mode !== "stopped" && root.gauge > 0.01
+    loops: Animation.Infinite
+    NumberAnimation { target: root; property: "wave"; from: 0; to: 1; duration: root.warn ? 900 : 1500; easing.type: Easing.InOutSine }
+    PropertyAction { target: root; property: "wave"; value: -1 }
+    PauseAnimation { duration: root.warn ? 1200 : 3500 }
+    onRunningChanged: if (!running) root.wave = -1
+  }
+  // A new level gets a sweep right away, so the change is easy to notice.
+  onGaugeChanged: if (sweep.running && Math.abs(gauge - _shownGauge) > 0.02) { _shownGauge = gauge; sweep.restart() }
+  property real _shownGauge: 0
 
   Timer {
     running: root.animate && (root.mode === "thinking" || root.mode === "loading")
@@ -132,13 +178,14 @@ Item {
       height: root.cell
       radius: root.cell * 0.24 * (look[1] < 0.6 ? 2 : 1)   // dots go round
       antialiasing: true
-      color: upper ? (root.warn ? root.warnColor : root.gaugeColor) : root.color
+      color: upper ? root.gaugeCellColor(row, col) : root.color
       opacity: look[0]
       scale: look[1]
 
-      Behavior on opacity { NumberAnimation { duration: Style.duration(110); easing.type: Easing.OutCubic } }
+      // smoothing would smear the moving glow, so gauge cells skip it mid-sweep
+      Behavior on opacity { enabled: !(cellItem.upper && root.wave >= 0); NumberAnimation { duration: Style.duration(110); easing.type: Easing.OutCubic } }
       Behavior on scale { NumberAnimation { duration: Style.duration(160); easing.type: Easing.OutCubic } }
-      Behavior on color { ColorAnimation { duration: Style.duration(180) } }
+      Behavior on color { enabled: !(cellItem.upper && root.wave >= 0); ColorAnimation { duration: Style.duration(180) } }
     }
   }
 }
