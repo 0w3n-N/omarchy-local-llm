@@ -7,7 +7,7 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 
-// Bar widget for a local llama.cpp router (local-llm.service + the bundled bin/llm CLI).
+// Bar widget for a local llama.cpp router (local-llm.service + the bundled bin/lllm CLI).
 // Click: panel. Right-click: unload the model in VRAM. Middle-click: web UI.
 Panel {
   id: root

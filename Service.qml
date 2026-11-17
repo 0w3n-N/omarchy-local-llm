@@ -2,7 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// State for the llama.cpp router (local-llm.service, see `bin/llm --help`).
+// State for the llama.cpp router (local-llm.service, see `bin/lllm --help`).
 // Model ids from the server are validated and only ever passed as argv or
 // JSON to curl; the few `sh -c` commands here are fixed strings.
 Item {
@@ -16,7 +16,7 @@ Item {
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 5, 2, 300)
   readonly property string baseUrl: "http://127.0.0.1:" + port
   readonly property string unitName: "local-llm.service"
-  // Written by `llm setup --api-key`: one "Authorization: Bearer …" line,
+  // Written by `lllm setup --api-key`: one "Authorization: Bearer …" line,
   // handed to curl as `-H @file` so the key never shows up in argv.
   readonly property string authHeaderPath: (Quickshell.env("XDG_CONFIG_HOME") || Quickshell.env("HOME") + "/.config") + "/local-llm/api-key.header"
   property bool authRequired: false
@@ -26,10 +26,10 @@ Item {
   property bool polled: false
   // systemd's view while the HTTP API is down: inactive | failed | activating | unknown
   property string unitState: "unknown"
-  // False until `llm setup` has installed local-llm.service.
+  // False until `lllm setup` has installed local-llm.service.
   property bool installed: true
   // The CLI ships with the plugin; run it from here so it works without PATH changes.
-  readonly property string cliPath: String(Qt.resolvedUrl("bin/llm")).replace(/^file:\/\//, "")
+  readonly property string cliPath: String(Qt.resolvedUrl("bin/lllm")).replace(/^file:\/\//, "")
   property var models: []          // [{ id, status, vision, aliases }]
   property int vramMiB: -1         // llama-server VRAM, -1 = unknown
   property int gpuUsedMiB: 0       // whole GPU, every process

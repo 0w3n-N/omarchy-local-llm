@@ -53,5 +53,5 @@
   "hero.notSetUp": "Not set up yet",
   "server.setup": "Run setup",
   "tip.notSetUp": "Local LLM · click to set up",
-  "offline.setupHelp": "Flip the switch to run setup in a terminal. It checks for llama.cpp, then installs a systemd user service (local-llm) and the llm command. Nothing existing is overwritten without asking."
+  "offline.setupHelp": "Flip the switch to run setup in a terminal. It checks for llama.cpp, then installs a systemd user service (local-llm) and the lllm command. Nothing existing is overwritten without asking."
 }

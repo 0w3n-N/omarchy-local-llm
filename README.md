@@ -41,10 +41,10 @@ Then open the panel and flip the switch. The first time, this runs **setup** in 
 1. checks that `llama-server` and `curl` are installed, and tells you what to install if not;
 2. writes three systemd **user** units to `~/.config/systemd/user/`: `local-llm.service` (the server), and `local-llm-reload.path` / `.service` (rescan when models or presets change);
 3. creates `~/.config/local-llm/presets.ini` if it doesn't exist;
-4. links `~/.local/bin/llm` to the bundled command-line tool, if nothing is there already;
+4. links `~/.local/bin/lllm` to the bundled command-line tool, if nothing is there already;
 5. enables and starts the service.
 
-Setup needs no `sudo`. It never replaces an existing file that differs without asking first. You can also run it yourself: `~/.config/omarchy/plugins/io.github.0w3n-n.local-llm/bin/llm setup`.
+Setup needs no `sudo`. It never replaces an existing file that differs without asking first. You can also run it yourself: `~/.config/omarchy/plugins/io.github.0w3n-n.local-llm/bin/lllm setup`.
 
 The service is named `local-llm` on purpose: Arch's `llama-cpp` package ships its own `llama-server.service`, and this plugin leaves that one alone.
 
@@ -52,66 +52,66 @@ The service is named `local-llm` on purpose: Arch's `llama-cpp` package ships it
 
 Panel buttons, left to right: pull a model, open llmfit, open the web UI, edit presets, show server logs, open a sandbox shell. Click a model to load or unload it. Keyboard: arrows and Enter, `s` server, `u` unload, `p` pull, `f` llmfit, `w` web UI, `e` presets, `l` logs, `b` sandbox shell, `r` refresh.
 
-The same things from a terminal:
+The same things from a terminal (the command is `lllm`; it was `llm` before 1.3):
 
 ```
-llm search qwen3 coder            find GGUF repos on Hugging Face
-llm quants <user/repo>            list quantizations with size and fit
-llm pull                          interactive: search, pick repo, pick quant
-llm pull <user/repo>[:QUANT]      download directly
-llm ls | rm <model> | unload      list, delete, free VRAM now
-llm info <model>                  explain a model: layers, experts, quantization, memory, fit
-llm serve | stop | restart | status | logs
-llm edit                          per-model settings
+lllm search qwen3 coder           find GGUF repos on Hugging Face
+lllm quants <user/repo>           list quantizations with size and fit
+lllm pull                         interactive: search, pick repo, pick quant
+lllm pull <user/repo>[:QUANT]     download directly
+lllm ls | rm <model> | unload     list, delete, free VRAM now
+lllm info <model>                 explain a model: layers, experts, quantization, memory, fit
+lllm serve | stop | restart | status | logs
+lllm edit                         per-model settings
 ```
 
-`llm info <model>` reads the model file itself and explains what it finds: the layer mix (attention, recurrent, mixture of experts), how many parameters work per token, the quantization and what it costs in quality, how much memory the context needs, built-in or sidecar speculative decoding, vision and audio input, chat-template features, and whether it fits on your GPU. Each line says what the trait means in general and what it means for that model. Any unique part of a name works: `llm info gemma`.
+`lllm info <model>` reads the model file itself and explains what it finds: the layer mix (attention, recurrent, mixture of experts), how many parameters work per token, the quantization and what it costs in quality, how much memory the context needs, built-in or sidecar speculative decoding, vision and audio input, chat-template features, and whether it fits on your GPU. Each line says what the trait means in general and what it means for that model. Any unique part of a name works: `lllm info gemma`.
 
-Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1` and use a model name from `llm ls`. The server listens on localhost only and refuses cross-origin requests from web pages (`--cors-origins localhost`), so a website open in your browser can't list, load, or unload your models. Apps that call the API directly, like agent harnesses or `curl`, aren't affected. llama.cpp enforces this from build b12340; older builds only hide the replies from the page, which could still send requests that load or unload a model. `llm setup` and `llm status` warn when your build is one of those.
+Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1` and use a model name from `lllm ls`. The server listens on localhost only and refuses cross-origin requests from web pages (`--cors-origins localhost`), so a website open in your browser can't list, load, or unload your models. Apps that call the API directly, like agent harnesses or `curl`, aren't affected. llama.cpp enforces this from build b12340; older builds only hide the replies from the page, which could still send requests that load or unload a model. `lllm setup` and `lllm status` warn when your build is one of those.
 
 To close that gap on older builds, or if you just want authentication, require an API key:
 
 ```
-llm setup --api-key       # generate a key and restart the server with it
-llm key                   # print it, to paste into your clients
-llm setup --no-api-key    # back to keyless
+lllm setup --api-key      # generate a key and restart the server with it
+lllm key                  # print it, to paste into your clients
+lllm setup --no-api-key   # back to keyless
 ```
 
-The key lives in `~/.config/local-llm/api-key` (readable only by you). The panel and the `llm` command use it automatically; give other clients the key along with `http://127.0.0.1:8080/v1`. With a key set, a web page can't load, unload, or query models on any llama.cpp version. `/health` stays open, as llama.cpp always allows it.
+The key lives in `~/.config/local-llm/api-key` (readable only by you). The panel and the `lllm` command use it automatically; give other clients the key along with `http://127.0.0.1:8080/v1`. With a key set, a web page can't load, unload, or query models on any llama.cpp version. `/health` stays open, as llama.cpp always allows it.
 
 ## Sandbox: let models run commands without touching your system
 
-Agent harnesses give models a bash tool. With a local model, you may not want that bash running as you, on your machine. `llm sandbox` gives you a Docker container for those commands, and you never have to use docker yourself:
+Agent harnesses give models a bash tool. With a local model, you may not want that bash running as you, on your machine. `lllm sandbox` gives you a Docker container for those commands, and you never have to use docker yourself:
 
 ```
-llm sandbox setup                 one time: installs/enables docker, gives you access, builds the box
-llm sandbox shell                 a shell inside (also the panel's 󰆍 button / b key)
-llm sandbox with omp              start any harness with its shell swapped for the sandbox
-llm sandbox run <command>         run one command inside
-llm sandbox status | stop | reset | offline | online | install <pkg> | config | remove
+lllm sandbox setup                one time: installs/enables docker, gives you access, builds the box
+lllm sandbox shell                a shell inside (also the panel's 󰆍 button / b key)
+lllm sandbox with omp             start any harness with its shell swapped for the sandbox
+lllm sandbox run <command>        run one command inside
+lllm sandbox status | stop | reset | offline | online | install <pkg> | config | remove
 ```
 
 `~/.local/bin/sandbox-bash` is a drop-in bash for the box. It accepts the same arguments as bash (`-c`, `-l -c`, scripts, stdin), returns the same exit codes, and passes kills and timeouts through to the command inside. How a harness is pointed at it differs:
 
-- **Claude Code:** `CLAUDE_CODE_SHELL=~/.local/bin/sandbox-bash` (`llm sandbox with claude` sets it).
-- **oh-my-pi (omp):** use `llm sandbox with omp`. omp's bash tool runs on its own built-in shell and ignores `$SHELL` and its `shellPath` setting, so `with omp` loads `bin/omp-sandbox.ts`, a small extension that replaces the bash tool and hands each command to `sandbox-bash` as one argument. It also leaves off omp's tools that would run code on the host (`eval`, `task`, `debug`, `lsp`). Don't use omp's command-prefix setting for this: it is pasted in front of the command as text, so in `a; b` only `a` would run in the box.
+- **Claude Code:** `CLAUDE_CODE_SHELL=~/.local/bin/sandbox-bash` (`lllm sandbox with claude` sets it).
+- **oh-my-pi (omp):** use `lllm sandbox with omp`. omp's bash tool runs on its own built-in shell and ignores `$SHELL` and its `shellPath` setting, so `with omp` loads `bin/omp-sandbox.ts`, a small extension that replaces the bash tool and hands each command to `sandbox-bash` as one argument. It also leaves off omp's tools that would run code on the host (`eval`, `task`, `debug`, `lsp`). Don't use omp's command-prefix setting for this: it is pasted in front of the command as text, so in `a; b` only `a` would run in the box.
 - **Anything else:** set its shell setting or `SHELL=` to `~/.local/bin/sandbox-bash`, then have the model run `hostname`. Inside the box it prints `sandbox`. If it prints your computer's name, the harness doesn't use that setting for its bash tool.
 
 What the box can reach:
 
 - **Files:** only `~/Sandbox`, mounted at the same path inside, so a harness started there has a working directory that's valid on both sides. Files the model creates there belong to you. Nothing else in your home is visible: no keys, dotfiles, or browser profiles.
-- **Environment:** none of your environment variables (API keys in your shell stay out). Add specific ones with `llm sandbox config env NAME1,NAME2`.
-- **Privileges:** an unprivileged user that can't gain root (`no-new-privileges`, no capabilities, no sudo, no docker socket). It's capped at 8 GB RAM, half your CPUs up to 8, and 1024 processes, all changeable with `llm sandbox config`.
-- **Network:** internet on, so `pip`, `npm`, and `git clone` work. `llm sandbox offline` cuts it completely.
-- **Persistence:** the container and anything installed in it persist until `llm sandbox reset`. `llm sandbox install <debian-pkg>` adds system packages that survive resets.
+- **Environment:** none of your environment variables (API keys in your shell stay out). Add specific ones with `lllm sandbox config env NAME1,NAME2`.
+- **Privileges:** an unprivileged user that can't gain root (`no-new-privileges`, no capabilities, no sudo, no docker socket). It's capped at 8 GB RAM, half your CPUs up to 8, and 1024 processes, all changeable with `lllm sandbox config`.
+- **Network:** internet on, so `pip`, `npm`, and `git clone` work. `lllm sandbox offline` cuts it completely.
+- **Persistence:** the container and anything installed in it persist until `lllm sandbox reset`. `lllm sandbox install <debian-pkg>` adds system packages that survive resets.
 
-Only shell commands are sandboxed. A harness's own read, write, and edit tools still run on the host with your permissions, so start the harness inside `~/Sandbox` (`llm sandbox with` does this) and keep its file-access settings limited to that folder. Setup adds you to the `docker` group, which is root-equivalent for programs running as you on the host. The model can't use that from inside the box.
+Only shell commands are sandboxed. A harness's own read, write, and edit tools still run on the host with your permissions, so start the harness inside `~/Sandbox` (`lllm sandbox with` does this) and keep its file-access settings limited to that folder. Setup adds you to the `docker` group, which is root-equivalent for programs running as you on the host. The model can't use that from inside the box.
 
 ### Settings
 
 `~/.config/local-llm/presets.ini` holds llama-server flags. The `[*]` section applies to every model; a section named after a model overrides it. The defaults free an idle model after 10 minutes (`sleep-idle-seconds = 600`) and cap context at 32k tokens (`ctx-size = 32768`), because without a cap llama.cpp allocates each model's full trained context and can fill your VRAM. Raise it per model when you need more. Saving the file applies it; a model that is already loaded picks it up on its next load.
 
-Models live in `~/.cache/llmfit/models` (set `LLM_MODELS_DIR` to change where the `llm` command looks; the service uses the default path).
+Models live in `~/.cache/llmfit/models` (set `LLM_MODELS_DIR` to change where the `lllm` command looks; the service uses the default path).
 
 The widget's own settings are the server port (default 8080) and how often it checks the server while the panel is closed (default 5 seconds).
 
@@ -122,28 +122,29 @@ Plugins run unsandboxed inside the Omarchy shell, so here is everything this one
 - `curl` to `127.0.0.1` only (model list, load, unload); with an API key set, curl reads the header from `~/.config/local-llm/api-key.header` (`-H @file`), so the key never appears in a process list
 - `systemctl --user` to start, stop, and inspect `local-llm.service`
 - `nvidia-smi` and `cat /proc/<pid>/stat` for the VRAM gauge and the "generating" state, only while a model is loaded
-- the bundled `bin/llm` in a terminal, when you press a button that needs it (the sandbox button runs `llm sandbox shell`, which runs setup with `sudo` first if needed)
+- the bundled `bin/lllm` in a terminal, when you press a button that needs it (the sandbox button runs `lllm sandbox shell`, which runs setup with `sudo` first if needed)
 
-It makes no network requests of its own. `llm search` and `llm pull` talk to huggingface.co when you run them.
+It makes no network requests of its own. `lllm search` and `lllm pull` talk to huggingface.co when you run them.
 
 ## Remove
 
 ```sh
-llm sandbox remove            # deletes the sandbox container and image (keeps ~/Sandbox)
-llm uninstall                 # stops the service, removes the three units and the llm link
+lllm sandbox remove           # deletes the sandbox container and image (keeps ~/Sandbox)
+lllm uninstall                # stops the service, removes the three units and the lllm link
 omarchy plugin remove io.github.0w3n-n.local-llm
 ```
 
-Run `llm uninstall` first, since it lives inside the plugin folder. It keeps your downloaded models (`~/.cache/llmfit/models`) and your settings (`~/.config/local-llm`). Delete those two folders by hand if you want them gone.
+Run `lllm uninstall` first, since it lives inside the plugin folder. It keeps your downloaded models (`~/.cache/llmfit/models`) and your settings (`~/.config/local-llm`). Delete those two folders by hand if you want them gone.
 
 ## Troubleshooting
 
-- **"Not set up yet"**: flip the switch in the panel, or run `llm setup`.
-- **The service fails to start**: `llm logs`. The usual causes are a missing GPU backend package or another program on port 8080.
-- **A model is slow or only partly on the GPU**: it doesn't fit in VRAM alongside its context. Pick a smaller quantization (`llm quants <repo>`) or lower `ctx-size` for that model.
-- **A new download doesn't appear**: `llm ls` forces a rescan.
-- **Sandbox says "log out and back in"**: setup added you to the docker group but this login doesn't have it yet. Run `llm sandbox setup` again to bridge the session, or log out and back in.
-- **Something in the sandbox is broken**: `llm sandbox reset` gives you a fresh container. Your files in `~/Sandbox` are kept.
+- **"Not set up yet"**: flip the switch in the panel, or run `lllm setup`.
+- **`lllm: command not found` after updating from 1.2**: 1.3 renamed `llm` to `lllm`. Running the old `llm` once (or any panel button) moves your `~/.local/bin` links and the reload unit to the new name. Or run `~/.config/omarchy/plugins/io.github.0w3n-n.local-llm/bin/lllm setup`.
+- **The service fails to start**: `lllm logs`. The usual causes are a missing GPU backend package or another program on port 8080.
+- **A model is slow or only partly on the GPU**: it doesn't fit in VRAM alongside its context. Pick a smaller quantization (`lllm quants <repo>`) or lower `ctx-size` for that model.
+- **A new download doesn't appear**: `lllm ls` forces a rescan.
+- **Sandbox says "log out and back in"**: setup added you to the docker group but this login doesn't have it yet. Run `lllm sandbox setup` again to bridge the session, or log out and back in.
+- **Something in the sandbox is broken**: `lllm sandbox reset` gives you a fresh container. Your files in `~/Sandbox` are kept.
 
 ## License
 

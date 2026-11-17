@@ -1,5 +1,5 @@
-// omp extension loaded by `llm sandbox with omp`: the model's bash tool runs in
-// the llm sandbox container instead of omp's built-in shell on the host.
+// omp extension loaded by `lllm sandbox with omp`: the model's bash tool runs in
+// the lllm sandbox container instead of omp's built-in shell on the host.
 // Part of https://github.com/0w3n-N/omarchy-local-llm (MIT).
 //
 // omp's bash tool normally executes on its embedded shell engine and ignores
