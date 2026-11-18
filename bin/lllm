@@ -218,6 +218,16 @@ def migrate_legacy(quiet=False):
             unit.write_text(unit.read_text().replace(old_line, f"ExecStart=-{SELF} reload"))
             subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
             moved.append(f"{unit.name} -> lllm reload")
+        # The comments `lllm setup` wrote into presets.ini still name the old command.
+        # Only these exact template lines change, so the reload it triggers is harmless.
+        if PRESETS.is_file():
+            text = PRESETS.read_text()
+            fixed = text
+            for old in ("the next time it loads (`llm unload`).", "section name = model name from `llm ls`:"):
+                fixed = fixed.replace(old, old.replace("`llm ", "`lllm "))
+            if fixed != text:
+                PRESETS.write_text(fixed)
+                moved.append(f"{PRESETS.name} comments")
     except OSError as e:
         print(f"lllm: couldn't finish moving from the old `llm` name: {e}", file=sys.stderr)
     if moved and not quiet:
@@ -369,16 +379,51 @@ def _most_common_nonzero(v):
 
 
 def _model_files(path):
-    """(main gguf, mmproj or None, [draft sidecars]) of a local model."""
+    """(main gguf, mmproj or None, [draft sidecar], [unused ggufs]) of a local model.
+
+    Picked exactly as llama.cpp's router scans a model folder: in directory order, the
+    last mmproj, the first drafter (mtp-/dflash-/dspark-), the last first shard, else the
+    last other .gguf wins. A folder holding two quants therefore loads only one of them;
+    the other is reported as unused instead of being guessed at."""
     if path.is_file():
-        return path, None, []
-    ggufs = sorted(path.glob("*.gguf"))
-    mmproj = next((g for g in ggufs if "mmproj" in g.name), None)
-    drafts = [g for g in ggufs if g.name.startswith(("mtp-", "dflash-", "dspark-"))]
-    rest = [g for g in ggufs if g != mmproj and g not in drafts]
-    shards = [g for g in rest if "-00001-of-" in g.name]
-    main = shards[0] if shards else max(rest, key=lambda g: g.stat().st_size)
-    return main, mmproj, drafts
+        return path, None, [], []
+    ggufs, main, shard, mmproj, draft = [], None, None, None, None
+    with os.scandir(path) as it:
+        for e in it:
+            if not e.name.endswith(".gguf") or not e.is_file():
+                continue
+            p = Path(e.path)
+            ggufs.append(p)
+            if "mmproj" in e.name:
+                mmproj = p
+            elif e.name.startswith(("mtp-", "dflash-", "dspark-")):
+                draft = draft or p
+            elif "-00001-of-" in e.name:
+                shard = p
+            else:
+                main = p
+    used = {mmproj, draft}
+    if shard:
+        stem = shard.name.split("-00001-of-")[0] + "-"
+        used |= {g for g in ggufs if g.name.startswith(stem) and re.search(r"-\d{5}-of-\d{5}\.gguf$", g.name)}
+        main = shard
+    if main is None:
+        raise ValueError(f"no model .gguf in {path.name}")
+    used.add(main)
+    return main, mmproj, [draft] if draft else [], sorted(g for g in ggufs if g not in used)
+
+
+def model_bytes(path):
+    """(bytes the router loads, [unused ggufs]) for a local model."""
+    try:
+        main, mmproj, drafts, unused = _model_files(path)
+    except (OSError, ValueError):
+        return disk_size(path), []
+    unused_set = set(unused)
+    if path.is_file():
+        return path.stat().st_size, []
+    loaded = sum(f.stat().st_size for f in path.rglob("*.gguf") if f.is_file() and f not in unused_set)
+    return loaded, unused
 
 
 def _preset(name):
@@ -490,7 +535,13 @@ def cmd_info(args):
             print(f"  {n}")
         return
     name, path = resolve_local(args[0])
-    main, mmproj, drafts = _model_files(path)
+    try:
+        main, mmproj, drafts, unused = _model_files(path)
+    except (OSError, ValueError) as e:
+        die(str(e))
+    loaded_bytes, _ = model_bytes(path)
+    on_disk = f"{gb(loaded_bytes)}" + (f" (+{gb(sum(u.stat().st_size for u in unused))} in "
+                                      f"{', '.join(u.name for u in unused)}, never loaded)" if unused else "")
     try:
         kv, tensors = read_gguf(main)
     except (OSError, ValueError, KeyError) as e:
@@ -500,7 +551,7 @@ def cmd_info(args):
     preset = _preset(name)
     out = _Out(color)
     if arch == "dflash" or arch.endswith(("-assistant", "_assistant")) or main.name.startswith(("mtp-", "dflash-", "dspark-")):
-        out.title(name, f"{main.name}  ·  {gb(disk_size(path))} on disk")
+        out.title(name, f"{main.name}  ·  {on_disk}")
         out.section("Draft model")
         out.trait("What this is", f"{arch} drafter for {kv.get('general.name', 'a larger model')}",
                   "A small model used only for speculative decoding: it guesses tokens ahead and the big model "
@@ -540,7 +591,7 @@ def cmd_info(args):
     # ---- header
     base = [kv.get(f"general.base_model.{i}.organization", "") + "/" + kv.get(f"general.base_model.{i}.name", "")
             for i in range(kv.get("general.base_model.count", 0) or 0)]
-    out.title(name, f"{main.name}  ·  {gb(disk_size(path))} on disk")
+    out.title(name, f"{main.name}  ·  {on_disk}")
 
     # ---- identity
     out.section("Identity")
@@ -1022,24 +1073,37 @@ def cmd_ls(args):
     local = local_models()
     if srv is None:
         print("(server not running — `lllm serve`)")
-        rows = [(n, "-", disk_size(p), "") for n, p in local.items()]
+        rows = [(n, "-", *model_bytes(p), "-", "") for n, p in local.items()]
     else:
         rows = []
         for m in srv:
-            args_ = m["status"]["args"]
+            args_ = m["status"].get("args") or []
             local_path = local.get(m["id"])
-            size = disk_size(local_path) if local_path else 0
+            size, unused = model_bytes(local_path) if local_path else (0, [])
+            # The context the model really runs with. /v1/models' context_length is the
+            # training maximum, which clients that read it (and don't parse the preset)
+            # would wrongly use as their budget.
+            i = args_.index("--ctx-size") if "--ctx-size" in args_ else -1
+            ctx = args_[i + 1] if 0 <= i < len(args_) - 1 and args_[i + 1] != "0" else m.get("context_length", "-")
             vision = "vision" if "--mmproj" in args_ else ""
             alias = ",".join(m.get("aliases") or [])
             extra = " ".join(x for x in (vision, f"alias={alias}" if alias else "") if x)
-            rows.append((m["id"], m["status"]["value"], size, extra))
+            rows.append((m["id"], m["status"]["value"], size, unused, ctx, extra))
     if not rows:
         print(f"no models yet in {MODELS}\n  lllm search <query>  ->  lllm pull <user/repo>")
         return
     w = max(len(r[0]) for r in rows)
-    print(f"{'MODEL':<{w}}  {'STATUS':<9} {'SIZE':>9}  ")
-    for n, st, size, extra in rows:
-        print(f"{n:<{w}}  {st:<9} {gb(size):>9}  {extra}")
+    print(f"{'MODEL':<{w}}  {'STATUS':<9} {'SIZE':>9}  {'CTX':>7}  ")
+    notes = []
+    for n, st, size, unused, ctx, extra in rows:
+        print(f"{n:<{w}}  {st:<9} {gb(size):>9}  {ctx!s:>7}  {extra}".rstrip())
+        if unused:
+            notes.append(f"  {n}: {', '.join(u.name for u in unused)} ({gb(sum(u.stat().st_size for u in unused))}) "
+                         "is never loaded — llama.cpp loads one model file per folder")
+    print("\nCTX = the context each model runs with; pin it in clients that ask (llama.cpp reports the "
+          "training maximum).")
+    if notes:
+        print("unused files (delete or move them to free the space):\n" + "\n".join(notes))
 
 
 def loaded_names():
@@ -1442,7 +1506,7 @@ def save_bench(data):
 def model_profile(path):
     """Size facts for ranking, from the GGUF header (None for drafter sidecars / unreadable files)."""
     try:
-        main, mmproj, drafts = _model_files(path)
+        main, mmproj, drafts, _ = _model_files(path)
         kv, tensors = read_gguf(main)
     except (OSError, ValueError, KeyError):
         return None

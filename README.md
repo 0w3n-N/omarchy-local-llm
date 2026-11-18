@@ -114,7 +114,7 @@ Only shell commands are sandboxed. A harness's own read, write, and edit tools s
 
 ### Settings
 
-`~/.config/local-llm/presets.ini` holds llama-server flags. The `[*]` section applies to every model; a section named after a model overrides it. The defaults free an idle model after 10 minutes (`sleep-idle-seconds = 600`) and cap context at 32k tokens (`ctx-size = 32768`), because without a cap llama.cpp allocates each model's full trained context and can fill your VRAM. Raise it per model when you need more. Saving the file applies it; a model that is already loaded picks it up on its next load.
+`~/.config/local-llm/presets.ini` holds llama-server flags. The `[*]` section applies to every model; a section named after a model overrides it. The defaults free an idle model after 10 minutes (`sleep-idle-seconds = 600`) and cap context at 32k tokens (`ctx-size = 32768`), because without a cap llama.cpp allocates each model's full trained context and can fill your VRAM. Raise it per model when you need more. Saving the file applies it; a model that is already loaded picks it up on its next load. The server's model list (`/v1/models`) reports each model's *trained* maximum as `context_length`, not this cap, so a client that sizes conversations from it can overrun the real limit. `lllm ls` shows the context each model actually runs with (CTX); enter that in clients that let you set a model's context.
 
 Models live in `~/.cache/llmfit/models` (set `LLM_MODELS_DIR` to change where the `lllm` command looks; the service uses the default path).
 
@@ -148,6 +148,7 @@ Run `lllm uninstall` first, since it lives inside the plugin folder. It keeps yo
 - **The service fails to start**: `lllm logs`. The usual causes are a missing GPU backend package or another program on port 8080.
 - **A model is slow or only partly on the GPU**: it doesn't fit in VRAM alongside its context. Pick a smaller quantization (`lllm quants <repo>`) or lower `ctx-size` for that model.
 - **A new download doesn't appear**: `lllm ls` forces a rescan.
+- **A folder holds two model files**: llama.cpp loads only one `.gguf` per model folder (plus its `mmproj`/drafter). `lllm ls` lists any file it never loads, so you can delete it or give it its own folder.
 - **Sandbox says "log out and back in"**: setup added you to the docker group but this login doesn't have it yet. Run `lllm sandbox setup` again to bridge the session, or log out and back in.
 - **Something in the sandbox is broken**: `lllm sandbox reset` gives you a fresh container. Your files in `~/Sandbox` are kept.
 
