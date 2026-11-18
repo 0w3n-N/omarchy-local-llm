@@ -39,9 +39,19 @@ BIN_LINK = Path.home() / ".local/bin/lllm"
 SELF = Path(__file__).resolve()
 CTX_HEADROOM_GB = 2.5  # VRAM kept free for KV cache + compute buffers
 
+# A quant tag stands on its own between separators: "PQ2_0" must not read as "Q2_0".
 QUANT_RE = re.compile(
-    r"(?:UD-)?(?:I?Q\d(?:_[A-Z0-9]+)*|BF16|F16|F32|MXFP4(?:_MOE)?|TQ\d_\d)", re.I
+    r"(?<![A-Za-z0-9])(?:UD-)?(?:PTQ\d_\d|PQ\d_\d|TQ\d_\d|I?Q\d(?:_[A-Z0-9]+)*|BF16|F16|F32|MXFP4(?:_MOE)?|NVFP4)"
+    r"(?![A-Za-z0-9])", re.I
 )
+# Packed ternary formats that only PrismML's llama.cpp fork can load; stock builds
+# read the same models from their Q2_0 files.
+FORK_ONLY = {"PQ2_0", "PTQ1_0"}
+
+
+def fork_only(quant):
+    return quant.upper().removesuffix("-MTP") in FORK_ONLY
+DRAFT_RE = re.compile(r"(?:^|[-_.])(?:dflash|dspark|eagle)", re.I)
 SPLIT_RE = re.compile(r"-\d{5}-of-\d{5}$")
 FULL_PRECISION = {"F32", "F16", "BF16"}
 
@@ -117,35 +127,52 @@ def hf_api():
 
 
 def quant_of(filename):
+    """The weights' quant tag. The first tag wins ("PQ2_0-MTP-Q8_0" is PQ2_0 weights with
+    a Q8_0 MTP head), except a full-precision tag before a real quant ("F16-Q4_K_M")."""
     stem = SPLIT_RE.sub("", Path(filename).name[: -len(".gguf")])
-    hits = QUANT_RE.findall(stem)
-    return hits[-1].upper() if hits else stem
+    hits = [h.upper() for h in QUANT_RE.findall(stem)]
+    real = [h for h in hits if h not in FULL_PRECISION]
+    return (real or hits)[0] if hits else stem
 
 
 def repo_quants(repo):
-    """{quant: {"files": [...], "size": bytes}}, plus the preferred mmproj file."""
+    """({quant: {"files": [...], "size": bytes}}, preferred mmproj, drafter) — the last two
+    as (filename, size) or None."""
     try:
         info = hf_api().model_info(repo, files_metadata=True)
     except Exception as e:  # RepositoryNotFound, GatedRepo, network...
         die(f"can't read {repo}: {e.__class__.__name__}: {str(e).splitlines()[0]}")
-    quants, mmprojs = {}, []
+    quants, mmprojs, drafters = {}, [], []
     for s in info.siblings:
         name = s.rfilename
         if not name.lower().endswith(".gguf"):
             continue
-        if Path(name).name.lower().startswith("mmproj"):
+        base = Path(name).name
+        if "mmproj" in base.lower():  # the same test llama.cpp uses
             mmprojs.append((name, s.size or 0))
             continue
-        q = quants.setdefault(quant_of(name), {"files": [], "size": 0})
+        if DRAFT_RE.search(base) or base.lower().startswith("mtp-"):
+            drafters.append((name, s.size or 0))
+            continue
+        key = quant_of(name)
+        if re.search(r"(?<![A-Za-z])MTP(?![A-Za-z])", SPLIT_RE.sub("", base[:-5]), re.I):
+            key += "-MTP"  # the same quant with built-in MTP layers is a separate download
+        q = quants.setdefault(key, {"files": [], "size": 0})
         q["files"].append(name)
         q["size"] += s.size or 0
+    for key in [k for k in quants if k.endswith("-MTP") and k[:-4] not in quants]:
+        quants[key[:-4]] = quants.pop(key)  # only one flavour: keep the plain quant name
     mmproj = None
     for pref in (r"(?<![A-Z])F16", r"BF16", r"Q8_0", r""):
         match = [m for m in mmprojs if re.search(pref, Path(m[0]).name.upper())]
         if match:
             mmproj = match[0]
             break
-    return quants, mmproj
+    # Only kinds the router attaches by file name (dflash-/dspark-/mtp-); an EAGLE3 head
+    # needs `spec-type = draft-eagle3` + `model-draft` in presets, so it isn't pulled.
+    attachable = [d for d in drafters if not re.search(r"eagle", Path(d[0]).name, re.I)]
+    drafter = min(attachable, key=lambda d: d[1]) if attachable else None
+    return quants, mmproj, drafter
 
 
 def fit_label(size, vram, ram):
@@ -164,7 +191,7 @@ def ranked(quants, mmproj, vram, ram):
     extra = mmproj[1] if mmproj else 0
     rows = [(q, v["size"] + extra, fit_label(v["size"] + extra, vram, ram)) for q, v in quants.items()]
     rows.sort(key=lambda r: -r[1])
-    gpu = [r for r in rows if r[2] in ("GPU", "CPU") and r[0] not in FULL_PRECISION]
+    gpu = [r for r in rows if r[2] in ("GPU", "CPU") and r[0] not in FULL_PRECISION and not fork_only(r[0])]
     rec = gpu[0][0] if gpu else None
     if rec:
         rows.sort(key=lambda r: r[0] != rec)
@@ -923,27 +950,30 @@ def cmd_search(args):
     print("\nNext: lllm quants <repo>   or   lllm pull <repo>")
 
 
-def print_quants(repo, rows, rec, mmproj, vram):
+def print_quants(repo, rows, rec, mmproj, vram, drafter=None):
     if vram > 0:
         print(f"{repo}  (VRAM {vram:.0f} GB; 'GPU' = fits fully with ~{CTX_HEADROOM_GB:g} GB left for context)")
     else:
         print(f"{repo}  (no NVIDIA GPU detected; 'CPU' = fits in half of system RAM)")
     if mmproj:
         print(f"vision projector: {mmproj[0]} ({gb(mmproj[1])}, included in sizes)")
+    if drafter:
+        print(f"speculative drafter: {drafter[0]} ({gb(drafter[1])}, pulled alongside; --no-draft skips it)")
     for q, size, fit in rows:
-        print(f"  {q:<14} {gb(size):>9}  {fit:<8}{'  <- recommended' if q == rec else ''}")
+        note = "  <- recommended" if q == rec else ("  needs PrismML's llama.cpp fork" if fork_only(q) else "")
+        print(f"  {q:<14} {gb(size):>9}  {fit:<8}{note}")
 
 
 def cmd_quants(args):
     if len(args) != 1:
         die("usage: lllm quants <user/repo>")
     repo = args[0].split(":")[0]
-    quants, mmproj = repo_quants(repo)
+    quants, mmproj, drafter = repo_quants(repo)
     if not quants:
         die(f"{repo} has no GGUF files")
     vram = vram_gb()
     rows, rec = ranked(quants, mmproj, vram, ram_gb())
-    print_quants(repo, rows, rec, mmproj, vram)
+    print_quants(repo, rows, rec, mmproj, vram, drafter)
 
 
 def pick_quant(repo, quants, mmproj):
@@ -1000,27 +1030,32 @@ def cmd_pull(args):
         name_override = args[i + 1]
         del args[i : i + 2]
     no_mmproj = "--no-mmproj" in args
-    args = [a for a in args if a != "--no-mmproj"]
+    no_draft = "--no-draft" in args
+    args = [a for a in args if a not in ("--no-mmproj", "--no-draft")]
     if not args and sys.stdin.isatty() and shutil.which("fzf"):
         args = [interactive_repo()]
     if len(args) != 1:
-        die("usage: lllm pull <user/repo>[:QUANT] [--name NAME] [--no-mmproj]")
+        die("usage: lllm pull <user/repo>[:QUANT] [--name NAME] [--no-mmproj] [--no-draft]")
     spec = args[0]
     spec = re.sub(r"^(https?://)?(www\.)?huggingface\.co/", "", spec).strip("/")
     repo, _, quant = spec.partition(":")
     if repo.count("/") != 1:
         die(f"'{repo}' isn't a user/repo id (try `lllm search`)")
 
-    quants, mmproj = repo_quants(repo)
+    quants, mmproj, drafter = repo_quants(repo)
     if not quants:
         die(f"{repo} has no GGUF files")
     if no_mmproj:
         mmproj = None
+    if no_draft:
+        drafter = None
     if quant:
         match = {q: v for q, v in quants.items() if q.upper() == quant.upper()}
         if not match:
             die(f"no {quant} in {repo}. Available: " + ", ".join(sorted(quants)))
         quant = next(iter(match))
+        if fork_only(quant):
+            print(f"note: {quant} only loads in PrismML's llama.cpp fork; stock llama.cpp needs the Q2_0 file")
     else:
         quant = pick_quant(repo, quants, mmproj)
 
@@ -1029,8 +1064,8 @@ def cmd_pull(args):
     if name in local_models():
         print(f"already have {name}  ({local_models()[name]})")
         return
-    files = quants[quant]["files"] + ([mmproj[0]] if mmproj else [])
-    total = quants[quant]["size"] + (mmproj[1] if mmproj else 0)
+    files = quants[quant]["files"] + ([mmproj[0]] if mmproj else []) + ([drafter[0]] if drafter else [])
+    total = quants[quant]["size"] + (mmproj[1] if mmproj else 0) + (drafter[1] if drafter else 0)
     free = shutil.disk_usage(MODELS.parent if MODELS.parent.exists() else Path.home()).free
     if total > free:
         die(f"need {gb(total)}, only {gb(free)} free")
@@ -1049,6 +1084,12 @@ def cmd_pull(args):
         src = stage / f
         if src.parent != stage:
             src.rename(stage / src.name)
+    if drafter:
+        # The router only attaches a drafter whose name starts with mtp-/dflash-/dspark-.
+        src = stage / Path(drafter[0]).name
+        if not src.name.lower().startswith(("mtp-", "dflash-", "dspark-")):
+            kind = "dspark" if "dspark" in src.name.lower() else "dflash"
+            src.rename(stage / f"{kind}-{src.name}")
     shutil.rmtree(stage / ".cache", ignore_errors=True)
     for d in sorted((p for p in stage.rglob("*") if p.is_dir()), reverse=True):
         try:
@@ -1977,7 +2018,7 @@ def completions(words, cword):
     if cmd == "pull":
         if prev == "--name":
             return []
-        return [f for f in ("--name", "--no-mmproj") if f not in rest]
+        return [f for f in ("--name", "--no-mmproj", "--no-draft") if f not in rest]
     if cmd == "info":
         flags = [f for f in ("--color", "--no-color") if f not in rest]
         return flags + ([] if any(a in models for a in rest) else models)
@@ -2068,8 +2109,9 @@ lllm — Hugging Face GGUF models served by llama.cpp (router at {SERVER})
   lllm search <query> [-n N]      find GGUF repos on Hugging Face
   lllm quants <user/repo>         list quants with size + VRAM fit
   lllm pull                       interactive: search -> pick repo -> pick quant
-  lllm pull <user/repo>[:QUANT]   download (picker if no QUANT; adds vision mmproj)
-        [--name NAME] [--no-mmproj]
+  lllm pull <user/repo>[:QUANT]   download (picker if no QUANT; adds the vision mmproj
+        [--name NAME] [--no-mmproj]   and a speculative drafter when the repo has them)
+        [--no-draft]
   lllm ls                         local models + loaded/unloaded status
   lllm info <model>               what a model is: architecture, MoE, quantization,
                                   context/KV memory, drafting, vision, fit on your GPU

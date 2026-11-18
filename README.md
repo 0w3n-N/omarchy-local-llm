@@ -6,7 +6,7 @@ Run local language models with [llama.cpp](https://github.com/ggml-org/llama.cpp
 
 - **One server, every model.** A single `llama-server` in router mode serves every GGUF model you've downloaded through an OpenAI-compatible API at `http://127.0.0.1:8080/v1`. A model loads the first time a request names it.
 - **Easy on your GPU.** One model is kept in VRAM at a time, and its weights are freed after 10 minutes idle. Right-click the bar icon to unload it immediately.
-- **Models from Hugging Face.** The Pull button searches Hugging Face, lists the quantizations of the repo you pick with a note on which ones fit your VRAM, and downloads your choice. Vision models get their `mmproj` file automatically.
+- **Models from Hugging Face.** The Pull button searches Hugging Face, lists the quantizations of the repo you pick with a note on which ones fit your VRAM, and downloads your choice. Vision models get their `mmproj` file automatically, and a repo's speculative-decoding drafter (DFlash, DSpark) comes along named so llama.cpp attaches it (`--no-draft` skips it). Packed ternary formats that only PrismML's llama.cpp fork loads (`PQ2_0`, `PTQ1_0`) are marked and never auto-picked; stock llama.cpp runs those models from their `Q2_0` file.
 - **Works with llmfit.** Models downloaded from [llmfit](https://github.com/AlexsJones/llmfit) land in the same folder and show up on their own.
 
 ## The icon
