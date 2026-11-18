@@ -958,7 +958,8 @@ def print_quants(repo, rows, rec, mmproj, vram, drafter=None):
     if mmproj:
         print(f"vision projector: {mmproj[0]} ({gb(mmproj[1])}, included in sizes)")
     if drafter:
-        print(f"speculative drafter: {drafter[0]} ({gb(drafter[1])}, pulled alongside; --no-draft skips it)")
+        print(f"speculative drafter: {drafter[0]} ({gb(drafter[1])}; --draft pulls it too: bench with and without, "
+              "a drafter that doesn't match your llama.cpp build only slows the model down)")
     for q, size, fit in rows:
         note = "  <- recommended" if q == rec else ("  needs PrismML's llama.cpp fork" if fork_only(q) else "")
         print(f"  {q:<14} {gb(size):>9}  {fit:<8}{note}")
@@ -1030,12 +1031,14 @@ def cmd_pull(args):
         name_override = args[i + 1]
         del args[i : i + 2]
     no_mmproj = "--no-mmproj" in args
-    no_draft = "--no-draft" in args
-    args = [a for a in args if a not in ("--no-mmproj", "--no-draft")]
+    # Opt-in: a drafter only helps when this llama.cpp build accepts its drafts; one that
+    # doesn't (0% acceptance) makes the model several times slower, silently.
+    want_draft = "--draft" in args
+    args = [a for a in args if a not in ("--no-mmproj", "--draft")]
     if not args and sys.stdin.isatty() and shutil.which("fzf"):
         args = [interactive_repo()]
     if len(args) != 1:
-        die("usage: lllm pull <user/repo>[:QUANT] [--name NAME] [--no-mmproj] [--no-draft]")
+        die("usage: lllm pull <user/repo>[:QUANT] [--name NAME] [--no-mmproj] [--draft]")
     spec = args[0]
     spec = re.sub(r"^(https?://)?(www\.)?huggingface\.co/", "", spec).strip("/")
     repo, _, quant = spec.partition(":")
@@ -1047,7 +1050,7 @@ def cmd_pull(args):
         die(f"{repo} has no GGUF files")
     if no_mmproj:
         mmproj = None
-    if no_draft:
+    if not want_draft:
         drafter = None
     if quant:
         match = {q: v for q, v in quants.items() if q.upper() == quant.upper()}
@@ -2018,7 +2021,7 @@ def completions(words, cword):
     if cmd == "pull":
         if prev == "--name":
             return []
-        return [f for f in ("--name", "--no-mmproj", "--no-draft") if f not in rest]
+        return [f for f in ("--name", "--no-mmproj", "--draft") if f not in rest]
     if cmd == "info":
         flags = [f for f in ("--color", "--no-color") if f not in rest]
         return flags + ([] if any(a in models for a in rest) else models)
@@ -2110,8 +2113,8 @@ lllm — Hugging Face GGUF models served by llama.cpp (router at {SERVER})
   lllm quants <user/repo>         list quants with size + VRAM fit
   lllm pull                       interactive: search -> pick repo -> pick quant
   lllm pull <user/repo>[:QUANT]   download (picker if no QUANT; adds the vision mmproj
-        [--name NAME] [--no-mmproj]   and a speculative drafter when the repo has them)
-        [--no-draft]
+        [--name NAME] [--no-mmproj]   when the repo has one; --draft also pulls its
+        [--draft]                     speculative drafter: bench with and without)
   lllm ls                         local models + loaded/unloaded status
   lllm info <model>               what a model is: architecture, MoE, quantization,
                                   context/KV memory, drafting, vision, fit on your GPU
