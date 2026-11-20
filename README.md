@@ -62,6 +62,7 @@ lllm pull <user/repo>[:QUANT]     download directly
 lllm ls | rm <model> | unload     list, delete, free VRAM now
 lllm info <model>                 explain a model: layers, experts, quantization, memory, fit
 lllm rank | bench <model…>        order models best-first; measure speed + a short quiz
+lllm classify <model> -l A,B …    choose between fixed labels, with probabilities
 lllm serve | stop | restart | status | logs
 lllm edit                         per-model settings
 ```
@@ -71,6 +72,19 @@ The panel lists your models best-first. `lllm bench <model>` (or `--missing` / `
 Tab completes every `lllm` command, subcommand and flag in bash, including your model names (`lllm info <Tab>`), the sandbox's commands and settings, and llmfit's own subcommands under `lllm fit`. Setup installs it to `~/.local/share/bash-completion/completions/` (needs the `bash-completion` package, which Omarchy ships); on an install from before 1.3.1, run `lllm completion install` once.
 
 `lllm info <model>` reads the model file itself and explains what it finds: the layer mix (attention, recurrent, mixture of experts), how many parameters work per token, the quantization and what it costs in quality, how much memory the context needs, built-in or sidecar speculative decoding, vision and audio input, chat-template features, and whether it fits on your GPU. Each line says what the trait means in general and what it means for that model. Any unique part of a name works: `lllm info gemma`.
+
+### Classify: a decision instead of a reply
+
+`lllm classify` asks a model to choose between fixed labels and returns a probability for each, from a single forward pass: it reads the label tokens' probabilities at the first answer position instead of generating and parsing text. Use it for yes/no checks, routing, tagging, or grading other models' answers.
+
+```
+lllm classify qwen3-0.6b -l positive,negative,neutral -s "Classify the sentiment of the review." "Arrived broken."
+echo "Is this email spam? …" | lllm classify qwen3-0.6b -l yes,no --json
+lllm classify <judge> --refusal --request "…" --response "…"    # did the reply attempt the request?
+lllm classify <model> -l bug,feature,question --jsonl < issues.jsonl > labelled.jsonl
+```
+
+It starts its own temporary llama-server on a random localhost port, on the CPU unless you pass `--gpu`, so the model loaded in the router keeps its VRAM; it stops the server when it finishes. With an API key set, that server requires the key too. `--jsonl` reads one JSON object per line (`{"text": …}`, or `{"request": …, "response": …}` with `--refusal`) and prints each back with `label` and `probs` added; `label_mass` says how much of the model's answer went to your labels at all (a low value means it wanted to say something else, and you get a warning). `--refusal` uses a built-in rubric with five labels (complied, partial, deflected, refused, incoherent) and also reports `attempted` = complied + partial; a small model trained on that rubric does much better than a general one. Small models are usually good enough when the labels are clear; check against a few examples you labelled yourself before trusting the numbers.
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1` and use a model name from `lllm ls`. The server listens on localhost only and refuses cross-origin requests from web pages (`--cors-origins localhost`), so a website open in your browser can't list, load, or unload your models. Apps that call the API directly, like agent harnesses or `curl`, aren't affected. llama.cpp enforces this from build b12340; older builds (including Arch's `llama-cpp` package at the time of writing) only hide the replies from the page, which could still send requests that load or unload a model.
 
@@ -155,6 +169,8 @@ Run `lllm uninstall` first, since it lives inside the plugin folder. It removes 
 ## Tests
 
 `tests/ownership.sh` checks that `lllm setup` and `lllm uninstall` only remove or change what setup wrote (systemd units you kept or edited, and other settings in `server.env`). It runs in a throwaway home directory with stubs for `systemctl`, `llama-server` and `curl`, so it never touches your real setup or starts a service. It takes a few seconds and needs `bash`, `python3` and `script`.
+
+`tests/classify.sh` checks `lllm classify` against a fake llama-server that returns fixed probabilities: how label probabilities are added up and normalised, `--jsonl` order, the refusal rubric, error handling, that the temporary server runs on the CPU and requires the API key when one is set, and that it is stopped afterwards.
 
 ## License
 
