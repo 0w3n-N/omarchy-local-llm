@@ -15,6 +15,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -1873,6 +1874,31 @@ def _free_port():
         return s.getsockname()[1]
 
 
+def _side_server_flags():
+    """Flags for every temporary llama-server lllm starts (bench quiz, classify), matching the
+    router: localhost only, cross-origin requests from web pages refused, no web UI, and the
+    API key whenever one is set. No keyless or open side door next to a locked router."""
+    flags = ["--host", "127.0.0.1", "--cors-origins", "localhost", "--no-webui"]
+    if KEY_FILE.exists():
+        flags += ["--api-key-file", str(KEY_FILE)]
+    return flags
+
+
+def _exit_on_hangup():
+    """Make SIGTERM and SIGHUP (a closed terminal, `kill`) end lllm through its normal exit
+    path, so the `finally` that stops a temporary server still runs. Returns a restore function."""
+    import threading
+
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None
+
+    def handler(signum, frame):
+        raise SystemExit(128 + signum)
+
+    old = {sig: signal.signal(sig, handler) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    return lambda: [signal.signal(sig, h) for sig, h in old.items()]
+
+
 def _quiz_server_cmd(model):
     """llama-server argv for a temporary copy of a router model with one slot per quiz
     question, built from the router's own resolved preset (model, drafter, cache types…)."""
@@ -1883,14 +1909,13 @@ def _quiz_server_cmd(model):
         if not line or line.startswith(("[", ";", "#")) or "=" not in line:
             continue
         key, val = (x.strip() for x in line.split("=", 1))
-        if key in ("port", "host", "parallel", "ctx-size", "alias", "sleep-idle-seconds", "api-key", "api-key-file"):
+        if key in ("port", "host", "parallel", "ctx-size", "alias", "sleep-idle-seconds", "api-key", "api-key-file",
+                   "cors-origins", "webui", "no-webui"):
             continue
         cmd += [f"--{key}"] if val.lower() == "true" else [f"--{key}", val]
     port = _free_port()
-    cmd += ["--host", "127.0.0.1", "--port", str(port), "--parallel", str(QUIZ_SLOTS),
-            "--ctx-size", str(QUIZ_SLOTS * QUIZ_SLOT_CTX)]
-    if KEY_FILE.exists():
-        cmd += ["--api-key-file", str(KEY_FILE)]   # same rule as the router: no keyless side door
+    cmd += ["--port", str(port), "--parallel", str(QUIZ_SLOTS), "--ctx-size", str(QUIZ_SLOTS * QUIZ_SLOT_CTX),
+            *_side_server_flags()]
     return cmd, port
 
 
@@ -1921,6 +1946,7 @@ def _quiz_parallel(model, status, single_tps=0):
     cmd, port = _quiz_server_cmd(model)
     log = RANK_FILE.parent / "bench-server.log"
     log.parent.mkdir(parents=True, exist_ok=True)
+    restore_signals = _exit_on_hangup()
     with open(log, "w") as lf:
         proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
     try:
@@ -1984,6 +2010,7 @@ def _quiz_parallel(model, status, single_tps=0):
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             proc.kill()
+        restore_signals()
         status.pop("port", None)
 
 
@@ -2227,7 +2254,7 @@ def _classify_one(base, system, user, labels):
     r = _post_json(f"{base}/v1/chat/completions", {
         "messages": msgs, "max_tokens": 1, "temperature": 0, "logprobs": True, "top_logprobs": 20,
         "chat_template_kwargs": {"enable_thinking": False}}, timeout=600)
-    content = r["choices"][0].get("logprobs", {}).get("content") or []
+    content = (r["choices"][0].get("logprobs") or {}).get("content") or []
     if not content:
         raise RuntimeError("the server returned no logprobs")
     return label_probs(content[0]["top_logprobs"], labels)
@@ -2242,7 +2269,8 @@ def cmd_classify(args):
         print(CLASSIFY_USAGE)
         return
     model, rest = args[0], args[1:]
-    labels, system, raw, refusal, request, response, jsonl, as_json, gpu, text = None, None, False, False, None, None, False, False, False, []
+    labels = system = request = response = None
+    flags, text = set(), []
     it = iter(rest)
     for a in it:
         try:
@@ -2257,8 +2285,7 @@ def cmd_classify(args):
             elif a == "--response":
                 response = next(it)
             elif a in ("--raw", "--refusal", "--jsonl", "--json", "--gpu"):
-                raw, refusal, jsonl, as_json, gpu = (raw or a == "--raw", refusal or a == "--refusal", jsonl or a == "--jsonl",
-                                                     as_json or a == "--json", gpu or a == "--gpu")
+                flags.add(a)
             elif a.startswith("-") and a != "-":
                 die(f"unknown option {a}\n\n{CLASSIFY_USAGE}")
             else:
@@ -2267,10 +2294,21 @@ def cmd_classify(args):
             die(f"{a} needs a value")
         except OSError as e:
             die(f"can't read {e.filename}: {e.strerror}")
+    raw, refusal, jsonl, as_json, gpu = (f in flags for f in ("--raw", "--refusal", "--jsonl", "--json", "--gpu"))
+    if jsonl and text:
+        die("--jsonl reads its input from stdin; drop the TEXT argument")
+    if (request is not None or response is not None) and not refusal:
+        die("--request and --response go with --refusal")
     if refusal:
+        if labels:
+            die("--refusal brings its own labels (C, P, D, R, I); drop -l")
+        if raw or text:
+            die("--refusal takes --request and --response (or --jsonl), not TEXT or --raw")
         labels, system = REFUSAL_LABELS, system or REFUSAL_RUBRIC
         if not jsonl and (request is None or response is None):
             die("--refusal needs --request and --response (or --jsonl)")
+        if jsonl and (request is not None or response is not None):
+            die("--refusal --jsonl reads the pairs from stdin; drop --request/--response")
     if not labels or len(labels) < 2:
         die("give at least two labels: -l yes,no")
     if len({lab.lower() for lab in labels}) != len(labels):
@@ -2280,6 +2318,8 @@ def cmd_classify(args):
         return t if raw else f"{t}\n\nAnswer with one of: {', '.join(labels)}."
 
     if jsonl:
+        if sys.stdin.isatty():
+            die("--jsonl reads JSON lines from stdin: lllm classify … --jsonl < items.jsonl")
         items = []
         for n, line in enumerate(sys.stdin, 1):
             if not line.strip():
@@ -2299,6 +2339,8 @@ def cmd_classify(args):
     elif refusal:
         items = [({}, _refusal_user(request, response))]
     else:
+        if not text and sys.stdin.isatty():
+            die("no input: give the text as an argument or pipe it in (lllm classify --help)")
         t = " ".join(text) if text and text != ["-"] else sys.stdin.read()
         if not t.strip():
             die("no input text")
@@ -2311,17 +2353,18 @@ def cmd_classify(args):
     if not binary:
         die("llama-server not found (lllm setup)")
     port = _free_port()
-    cmd = [binary, "-m", str(gguf), "--host", "127.0.0.1", "--port", str(port), "--jinja", "--no-webui",
-           "--parallel", str(CLASSIFY_SLOTS), "--ctx-size", str(CLASSIFY_SLOTS * CLASSIFY_SLOT_CTX),
-           "-ngl", "99" if gpu else "0"]
-    if KEY_FILE.exists():
-        cmd += ["--api-key-file", str(KEY_FILE)]   # same rule as the router: no keyless side door
+    cmd = [binary, "-m", str(gguf), "--port", str(port), "--jinja", "--parallel", str(CLASSIFY_SLOTS),
+           "--ctx-size", str(CLASSIFY_SLOTS * CLASSIFY_SLOT_CTX), "-ngl", "99" if gpu else "0", *_side_server_flags()]
     log = RANK_FILE.parent / "classify-server.log"
     log.parent.mkdir(parents=True, exist_ok=True)
-    with open(log, "w") as lf:
-        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
     base = f"http://127.0.0.1:{port}"
+    import concurrent.futures as cf
+
+    proc = pool = None
+    restore_signals = _exit_on_hangup()
     try:
+        with open(log, "w") as lf:
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
         for _ in range(600):
             if proc.poll() is not None:
                 die(f"llama-server exited while loading {gguf.name} (see {log})")
@@ -2332,18 +2375,21 @@ def cmd_classify(args):
                 time.sleep(0.2)
         else:
             die(f"llama-server did not come up (see {log})")
-        import concurrent.futures as cf
-
-        with cf.ThreadPoolExecutor(CLASSIFY_SLOTS) as ex:
-            results = list(ex.map(lambda x: _classify_one(base, system, x[1], labels), items))
-    except (urllib.error.URLError, RuntimeError, KeyError) as e:
+        pool = cf.ThreadPoolExecutor(CLASSIFY_SLOTS)
+        results = list(pool.map(lambda x: _classify_one(base, system, x[1], labels), items))
+    except (OSError, RuntimeError, KeyError, IndexError, ValueError) as e:
         die(f"classification failed: {e}")
     finally:
-        proc.terminate()
-        try:
-            proc.wait(15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        # stop the server first: requests still in flight then fail fast instead of being waited for
+        if proc:
+            proc.terminate()
+            try:
+                proc.wait(15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if pool:
+            pool.shutdown(wait=False, cancel_futures=True)
+        restore_signals()
     for (obj, _), (probs, mass) in zip(items, results):
         best = max(probs, key=probs.get)
         out = {"label": best, "probs": {k: round(v, 4) for k, v in probs.items()}, "label_mass": round(mass, 4)}
@@ -2442,7 +2488,7 @@ def completions(words, cword):
         if prev in ("-l", "--labels", "-s", "--system", "--request", "--response"):
             return []
         if prev in ("-S", "--system-file"):
-            return []
+            return ["@files"]
         if not rest:
             return models
         return [f for f in ("-l", "-s", "-S", "--raw", "--refusal", "--request", "--response", "--jsonl", "--json", "--gpu", "--help") if f not in rest]

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Tests for `lllm classify`: label-probability aggregation, batch order, the refusal
-# rubric, error handling, and what the temporary server is started with (CPU by
-# default, the API key file when one is set).
+# rubric, error handling, what its temporary server is started with (CPU by default,
+# localhost only, cross-origin requests refused, no web UI, the API key file when one
+# is set), that the server is stopped even when lllm is killed, and the same server
+# flags for the `lllm bench` quiz server.
 #
 # Runs in a throwaway $HOME with a fake llama-server (a small Python HTTP server on
 # PATH that answers /health and /v1/chat/completions with canned logprobs), so no
@@ -16,7 +18,7 @@ export LLM_MODELS_DIR=$WORK/models LLM_SERVER=http://127.0.0.1:9   # no router: 
 mkdir -p "$HOME" "$LLM_MODELS_DIR/tiny" "$WORK/stubs"; : > "$LLM_MODELS_DIR/tiny/tiny-Q4_K_M.gguf"
 cat > "$WORK/stubs/llama-server" <<'PY'
 #!/usr/bin/env python3
-import json, math, os, sys
+import json, math, os, sys, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 port = int(sys.argv[sys.argv.index("--port") + 1])
 open(os.path.expanduser("~/argv.log"), "a").write(" ".join(sys.argv[1:]) + "\n")
@@ -38,6 +40,10 @@ class H(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         open(os.path.expanduser("~/requests.log"), "a").write(json.dumps({"auth": self.headers.get("Authorization"), "body": body}) + "\n")
         user = body["messages"][-1]["content"]
+        if "CASE_SLOW" in user:
+            time.sleep(30)
+        if "CASE_NOLOGPROBS" in user:
+            return self._send(200, {"choices": [{"message": {"content": "a"}, "logprobs": None}]})
         dist = next((v for k, v in CANNED.items() if k in user), [("a", 1.0)])
         top = [{"token": t, "logprob": math.log(p)} for t, p in dist]
         self._send(200, {"choices": [{"message": {"content": dist[0][0]}, "logprobs": {"content": [{"token": dist[0][0], "top_logprobs": top}]}}]})
@@ -83,11 +89,16 @@ ok "duplicate labels are rejected" '! L tiny -l Yes,yes x 2>/dev/null'
 ok "--refusal without a pair is rejected" '! L tiny --refusal 2>/dev/null'
 ok "bad JSONL is rejected" '! (echo "nope" | L tiny -l a,b --jsonl 2>/dev/null)'
 ok "unknown model is rejected" '! L nosuch -l a,b x 2>/dev/null'
+ok "-l with --refusal is rejected" '! L tiny --refusal -l a,b --request r --response x 2>/dev/null'
+ok "TEXT with --jsonl is rejected" '! (echo "{\"text\":\"x\"}" | L tiny -l a,b --jsonl extra 2>/dev/null)'
+ok "--request without --refusal is rejected" '! L tiny -l a,b --request r x 2>/dev/null'
+ok "a reply without logprobs is an error, not a crash" '! L tiny -l a,b CASE_NOLOGPROBS 2>"$WORK/nl.txt" && grep -q "no logprobs" "$WORK/nl.txt" && ! grep -q Traceback "$WORK/nl.txt"'
 ok "unknown option is rejected" '! L tiny -l a,b --frobnicate x 2>/dev/null'
 ok "a .gguf path works" 'L "$LLM_MODELS_DIR/tiny/tiny-Q4_K_M.gguf" -l yes,no --json CASE_YESNO >/dev/null'
 
 : > "$HOME/argv.log"; L tiny -l yes,no CASE_YESNO >/dev/null
 ok "CPU by default (-ngl 0), localhost only" 'grep -q -- "-ngl 0" "$HOME/argv.log" && grep -q -- "--host 127.0.0.1" "$HOME/argv.log"'
+ok "web pages can't use it (--cors-origins localhost), no web UI" 'grep -q -- "--cors-origins localhost" "$HOME/argv.log" && grep -q -- "--no-webui" "$HOME/argv.log"'
 ok "no key file: no --api-key-file, no auth header" '! grep -q -- "--api-key-file" "$HOME/argv.log" && [ "$(tail -1 "$HOME/requests.log" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"auth\"])")" = None ]'
 : > "$HOME/argv.log"; L tiny -l yes,no --gpu CASE_YESNO >/dev/null
 ok "--gpu offloads (-ngl 99)" 'grep -q -- "-ngl 99" "$HOME/argv.log"'
@@ -95,6 +106,31 @@ mkdir -p "$XDG_CONFIG_HOME/local-llm"; echo "sekrit" > "$XDG_CONFIG_HOME/local-l
 : > "$HOME/argv.log"; L tiny -l yes,no CASE_YESNO >/dev/null
 ok "with a key: the temporary server requires it, and lllm sends it" 'grep -q -- "--api-key-file $XDG_CONFIG_HOME/local-llm/api-key" "$HOME/argv.log" && tail -1 "$HOME/requests.log" | grep -q "Bearer sekrit"'
 ok "the key never appears in argv" '! grep -q sekrit "$HOME/argv.log"'
+# killed mid-request (closed terminal / kill): the temporary server must not be left running
+for sig in TERM HUP; do
+    : > "$HOME/pids.log"
+    python3 -I "$LLLM" classify tiny -l yes,no "CASE_SLOW $sig" >/dev/null 2>&1 & lp=$!
+    for _ in $(seq 50); do grep -q "CASE_SLOW $sig" "$HOME/requests.log" 2>/dev/null && break; sleep 0.1; done
+    kill -$sig $lp; t0=$SECONDS; wait $lp; rc=$?
+    spid=$(head -1 "$HOME/pids.log")
+    ok "SIG$sig mid-request: lllm exits promptly ($((SECONDS - t0)) s, code $rc)" '[ $((SECONDS - t0)) -le 5 ] && [ $rc -ne 0 ]'
+    ok "SIG$sig mid-request: its server is stopped" '! kill -0 "$spid" 2>/dev/null'
+done
+: > "$HOME/pids.log"; L tiny -l yes,no CASE_YESNO >/dev/null
+
+ok "no input from a terminal: says what it needs instead of waiting" 'script -qec "python3 -I $LLLM classify tiny -l a,b" /dev/null </dev/null | grep -q "give the text as an argument or pipe it in"'
+
+# the bench quiz server gets the same flags (unit test of the command builder)
+python3 - "$LLLM" > "$WORK/quiz.txt" <<'PYQ'
+import sys, importlib.machinery, importlib.util
+loader = importlib.machinery.SourceFileLoader("lllm", sys.argv[1]); spec = importlib.util.spec_from_loader("lllm", loader)
+m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+model = {"status": {"args": ["/x/llama-server"], "preset": "[m]\nmodel = /m.gguf\ncors-origins = *\nwebui = true\nhost = 0.0.0.0\nn-gpu-layers = 99"}}
+cmd, port = m._quiz_server_cmd(model)
+print(" ".join(cmd))
+PYQ
+ok "bench quiz server: localhost, cors localhost (preset override dropped), no web UI, key" 'grep -q -- "--host 127.0.0.1" "$WORK/quiz.txt" && [ "$(grep -o -- "--cors-origins [^ ]*" "$WORK/quiz.txt")" = "--cors-origins localhost" ] && grep -q -- "--no-webui" "$WORK/quiz.txt" && ! grep -q -- "--webui\b" "$WORK/quiz.txt" && ! grep -q "0.0.0.0" "$WORK/quiz.txt" && grep -q -- "--api-key-file" "$WORK/quiz.txt" && grep -q -- "--n-gpu-layers 99" "$WORK/quiz.txt"'
+
 alive=0; while read -r pid; do kill -0 "$pid" 2>/dev/null && alive=$((alive+1)); done < "$HOME/pids.log"
 ok "every temporary server was stopped ($(wc -l < "$HOME/pids.log") started)" '[ $alive = 0 ]'
 
