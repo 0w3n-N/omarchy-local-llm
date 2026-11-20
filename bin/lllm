@@ -1405,10 +1405,8 @@ def save_setup_record(record):
         pass   # not empty, or already gone
 
 
-def _unit_template_re(body):
-    """The unit as setup renders it, with any absolute path for {llama_server}/{curl}/{lllm}."""
-    parts = re.split(r"\{(?:llama_server|curl|lllm)\}", body)
-    return re.compile(r"/\S+".join(re.escape(part) for part in parts))
+def render_unit(name, llama_server, curl):
+    return UNIT_FILES[name].format(llama_server=llama_server, curl=curl, lllm=SELF)
 
 
 def setup_wrote_unit(name, record):
@@ -1417,11 +1415,10 @@ def setup_wrote_unit(name, record):
         text = (UNIT_DIR / name).read_text()
     except OSError:
         return False
-    if record is not None:
-        return record.get(name) == _sha256(text)
-    # Installed by a version that kept no record (before 1.3.7): ours only if the
-    # file is exactly what setup writes today.
-    return _unit_template_re(UNIT_FILES[name]).fullmatch(text) is not None
+    # Without a record (installed before 1.3.7) nothing shows what setup wrote back then, and
+    # comparing with what it would write now can't either: the user may have pointed ExecStart at
+    # another llama-server that is also first on PATH. So no record means no unit counts as setup's.
+    return record is not None and record.get(name) == _sha256(text)
 
 
 def cmd_setup(args):
@@ -1449,7 +1446,7 @@ def cmd_setup(args):
     key_changed = api_key() != key_before
     record = load_setup_record() or {}
     for name, body in UNIT_FILES.items():
-        text = body.format(llama_server=llama_server, curl=curl, lllm=SELF)
+        text = render_unit(name, llama_server, curl)
         if write_if_wanted(UNIT_DIR / name, text):
             record[name] = _sha256(text)
         else:
@@ -1496,10 +1493,13 @@ def write_private(path, text):
 
 def enable_api_key():
     import secrets
+    rest = env_lines_without_key()   # before writing anything: dies if server.env can't be read
+    if ENV_FILE.exists() and not os.access(ENV_FILE, os.W_OK):
+        die(f"can't write {ENV_FILE}, so the key can't be switched on. "
+            "Fix its permissions (or remove it), then run this again.")
     key = api_key() or "llm-" + secrets.token_urlsafe(32)
     write_private(KEY_FILE, key + "\n")
     write_private(HEADER_FILE, f"Authorization: Bearer {key}\n")
-    rest = env_lines_without_key()
     if rest and not rest[-1].endswith("\n"):
         rest[-1] += "\n"
     write_private(ENV_FILE, "".join(rest) + f"{ENV_KEY_VAR}={KEY_FILE}\n")
@@ -1510,16 +1510,20 @@ def env_lines_without_key():
     """ENV_FILE's lines minus the API-key line; any other settings the user keeps there stay."""
     try:
         lines = ENV_FILE.read_text().splitlines(keepends=True)
-    except OSError:
+    except FileNotFoundError:
         return []
+    except OSError as e:
+        # It may hold settings we can't see; writing it back would destroy them.
+        die(f"can't read {ENV_FILE} ({e.strerror}), so lllm won't change it. "
+            "Fix its permissions (or remove it), then run this again.")
     return [l for l in lines if l.split("=", 1)[0].strip() != ENV_KEY_VAR]
 
 
 def disable_api_key():
     removed = False
     if ENV_FILE.exists():
+        rest = env_lines_without_key()   # unreadable: dies before anything is deleted
         before = ENV_FILE.read_text()
-        rest = env_lines_without_key()
         if "".join(rest) != before:
             removed = True
             if any(l.strip() for l in rest):
@@ -1568,19 +1572,20 @@ def cmd_uninstall(args):
         f = UNIT_DIR / name
         if not f.exists():
             continue
-        if setup_wrote_unit(name, record) or (
-                not yes and confirm(f"  {f} wasn't written by lllm setup (or was changed since). Remove it anyway?")):
+        why = ("has no setup record (it was installed before 1.3.7), so lllm can't tell whether setup wrote it"
+               if record is None else "wasn't written by lllm setup, or was changed since")
+        if setup_wrote_unit(name, record) or (not yes and confirm(f"  {f} {why}. Remove it anyway?")):
             ours.append(name)
         else:
-            theirs.append(name)
+            theirs.append((name, why))
     to_stop = [u for u in (UNIT, RELOAD_PATH_UNIT) if u in ours]
     if to_stop:
         systemctl("disable", "--now", *to_stop)
     for name in ours:
         (UNIT_DIR / name).unlink()
         print(f"  removed  {UNIT_DIR / name}")
-    for name in theirs:
-        print(f"  kept     {UNIT_DIR / name} (not written by lllm setup, or changed since)")
+    for name, why in theirs:
+        print(f"  kept     {UNIT_DIR / name} ({why})")
     save_setup_record({})
     systemctl("daemon-reload")
     if BIN_LINK.is_symlink() and BIN_LINK.resolve() == SELF:
@@ -1588,7 +1593,7 @@ def cmd_uninstall(args):
         print(f"  removed  {BIN_LINK}")
     remove_completion()
     if theirs:
-        print(f"\nLeft your own unit files in place and running as they were. To remove one: "
+        print(f"\nLeft those unit files in place and running as they were. To remove one: "
               f"systemctl --user disable --now <unit>, then delete it from {UNIT_DIR}.")
     print(f"\nKept your models ({MODELS}) and settings ({CONF_DIR}, including any API key).")
     print("Delete those two paths by hand if you want the disk space back.")

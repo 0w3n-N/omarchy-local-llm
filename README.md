@@ -139,7 +139,7 @@ lllm uninstall                # stops the service, removes the units setup wrote
 omarchy plugin remove io.github.0w3n-n.local-llm
 ```
 
-Run `lllm uninstall` first, since it lives inside the plugin folder. It removes a systemd unit only if `lllm setup` wrote it and it is unchanged since (setup records a checksum in `~/.local/state/local-llm/setup-units.json`). A unit you kept during setup, or edited afterwards, is left in place and still running, and uninstall tells you which. It keeps your downloaded models (`~/.cache/llmfit/models`) and your settings (`~/.config/local-llm`). Delete those two folders by hand if you want them gone.
+Run `lllm uninstall` first, since it lives inside the plugin folder. It removes a systemd unit only if `lllm setup` wrote it and it is unchanged since (setup records a checksum in `~/.local/state/local-llm/setup-units.json`). A unit you kept during setup, or edited afterwards, is left in place and still running, and uninstall tells you which. An install from before 1.3.7 has no checksum record, so nothing there counts as setup's: uninstall keeps its units (and asks about each one when you run it interactively); `lllm setup` writes the record. It keeps your downloaded models (`~/.cache/llmfit/models`) and your settings (`~/.config/local-llm`). Delete those two folders by hand if you want them gone.
 
 ## Troubleshooting
 

@@ -72,12 +72,22 @@ ck "only the reload path was disabled" 'grep -qx "systemctl --user disable --now
 ck "the user's service was never disabled" '! grep disable "$HOME/systemctl.log" | grep -qF local-llm.service'
 ck "the two units setup wrote are removed" '[ ! -e "$U/local-llm-reload.service" ] && [ ! -e "$U/local-llm-reload.path" ]'
 
-echo "C. install from before the record existed, units as setup writes them: removed"
-fresh C; run setup >/dev/null; rm -rf "$XDG_STATE_HOME"
+echo "C. install from before the record existed: nothing counts as setup's"
+fresh C; run setup >/dev/null; rm -rf "$XDG_STATE_HOME"; : > "$HOME/systemctl.log"
+out=$(run uninstall -y)
+ck "uninstall -y keeps all three units" '[ "$(ls "$U" | wc -l)" = 3 ]'
+ck "it says why" 'grep -q "no setup record" <<<"$out"'
+ck "nothing was disabled" '! grep -q disable "$HOME/systemctl.log"'
+fresh C2; run setup >/dev/null; rm -rf "$XDG_STATE_HOME"
+out=$(ask uninstall $'y\ny\ny\ny\n')
+ck "interactively, it asks about each unit" '[ "$(grep -o "no setup record" <<<"$out" | wc -l)" -ge 3 ]'
+ck "answering yes removes them" '[ -z "$(ls "$U" 2>/dev/null)" ]'
+fresh C3; run setup >/dev/null; rm -rf "$XDG_STATE_HOME"; run setup >/dev/null
+ck "re-running setup writes the record" '[ -s "$R" ]'
 run uninstall -y >/dev/null
-ck "all three units removed" '[ -z "$(ls "$U" 2>/dev/null)" ]'
+ck "after that, uninstall -y removes the units" '[ -z "$(ls "$U" 2>/dev/null)" ]'
 
-echo "D. install from before the record existed, one unit edited: kept"
+echo "D. install from before the record existed, one unit also edited: all kept"
 fresh D; run setup >/dev/null; rm -rf "$XDG_STATE_HOME"
 sed -i 's/--port 8080/--port 8099/' "$U/$SVC"; : > "$HOME/systemctl.log"
 run uninstall -y >/dev/null
@@ -143,6 +153,47 @@ run setup >/dev/null
 ck "its record entry survives" 'grep -q local-llm.service "$R"'
 run uninstall -y >/dev/null
 ck "uninstall removes it" '[ ! -e "$U/$SVC" ]'
+
+echo "L. no record, unit whose only change is the llama-server path: not setup's, so kept"
+fresh L; run setup >/dev/null; rm -rf "$XDG_STATE_HOME"
+sed -i "s|^ExecStart=[^ ]*llama-server|ExecStart=/opt/other/bin/llama-server|" "$U/$SVC"
+grep -q "^ExecStart=/opt/other/bin/llama-server" "$U/$SVC" || { echo "  (test setup failed: path not edited)"; fail=1; }
+: > "$HOME/systemctl.log"
+run uninstall -y >/dev/null
+ck "the unit is kept" '[ -e "$U/$SVC" ]'
+ck "it was never disabled" '! grep disable "$HOME/systemctl.log" | grep -qF local-llm.service'
+out=$(ask uninstall $'y\nn\n')
+ck "interactive uninstall asks about it" 'grep -q "Remove it anyway" <<<"$out"'
+ck "answering n keeps it" '[ -e "$U/$SVC" ]'
+
+echo "M. server.env that can't be read (or written) is never overwritten or deleted"
+if [ "$(id -u)" = 0 ]; then echo "  SKIP root can read and write any file, so these checks can't run"; else
+fresh M; run setup >/dev/null
+printf 'KEEP=1\n' > "$C/server.env"; chmod 200 "$C/server.env"
+run setup --api-key >/dev/null; rc=$?
+chmod 600 "$C/server.env"
+ck "--api-key leaves its content alone" '[ "$(cat "$C/server.env")" = "KEEP=1" ]'
+ck "--api-key fails instead of half-finishing" '[ $rc -ne 0 ] && [ ! -e "$C/api-key" ]'
+mv "$C/server.env" "$C/server.env.keep"; : > "$C/server.env"; chmod 200 "$C/server.env"
+printf 'secret\n' > "$C/api-key"; printf 'Authorization: Bearer secret\n' > "$C/api-key.header"
+run setup --no-api-key >/dev/null; rc=$?
+chmod 600 "$C/server.env"
+ck "--no-api-key fails and keeps the key files" '[ $rc -ne 0 ] && [ -e "$C/api-key" ] && [ -e "$C/api-key.header" ]'
+fresh M3; run setup >/dev/null
+printf 'KEEP=1\n' > "$C/server.env"; chmod 400 "$C/server.env"
+run setup --api-key >/dev/null; rc=$?
+chmod 600 "$C/server.env"
+ck "--api-key on a read-only server.env fails before writing any key file" '[ $rc -ne 0 ] && [ ! -e "$C/api-key" ] && [ "$(cat "$C/server.env")" = "KEEP=1" ]'
+fi
+
+echo "N. no record, user pointed ExecStart at their own llama-server that is also first on PATH"
+fresh N; run setup >/dev/null; rm -rf "$XDG_STATE_HOME"
+mkdir -p "$WORK/mine"; cp "$STUBS/llama-server" "$WORK/mine/llama-server"
+sed -i "s|^ExecStart=[^ ]*llama-server|ExecStart=$WORK/mine/llama-server|" "$U/$SVC"
+: > "$HOME/systemctl.log"
+PATH=$WORK/mine:$PATH run uninstall -y >/dev/null
+ck "the unit is kept" '[ -e "$U/$SVC" ]'
+ck "it was never disabled" '! grep disable "$HOME/systemctl.log" | grep -qF local-llm.service'
 
 echo
 if [ $fail = 0 ]; then echo "ALL PASS"; else echo "SOME FAILED"; fi
