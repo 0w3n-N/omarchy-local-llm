@@ -72,14 +72,14 @@ Tab completes every `lllm` command, subcommand and flag in bash, including your 
 
 `lllm info <model>` reads the model file itself and explains what it finds: the layer mix (attention, recurrent, mixture of experts), how many parameters work per token, the quantization and what it costs in quality, how much memory the context needs, built-in or sidecar speculative decoding, vision and audio input, chat-template features, and whether it fits on your GPU. Each line says what the trait means in general and what it means for that model. Any unique part of a name works: `lllm info gemma`.
 
-Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1` and use a model name from `lllm ls`. The server listens on localhost only and refuses cross-origin requests from web pages (`--cors-origins localhost`), so a website open in your browser can't list, load, or unload your models. Apps that call the API directly, like agent harnesses or `curl`, aren't affected. llama.cpp enforces this from build b12340; older builds only hide the replies from the page, which could still send requests that load or unload a model. `lllm setup` and `lllm status` warn when your build is one of those.
+Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1` and use a model name from `lllm ls`. The server listens on localhost only and refuses cross-origin requests from web pages (`--cors-origins localhost`), so a website open in your browser can't list, load, or unload your models. Apps that call the API directly, like agent harnesses or `curl`, aren't affected. llama.cpp enforces this from build b12340; older builds (including Arch's `llama-cpp` package at the time of writing) only hide the replies from the page, which could still send requests that load or unload a model.
 
-To close that gap on older builds, or if you just want authentication, require an API key:
+So `lllm setup` checks the server it starts. It runs keyless only when the server refuses requests from other websites itself; on an older build it requires an API key. The check runs with the key already on, so an older build never runs keyless, not even for a moment. If you set up an earlier version of this plugin keyless on an older build, run `lllm setup` again (`lllm status` warns until you do).
 
 ```
-lllm setup --api-key      # generate a key and restart the server with it
-lllm key                  # print it, to paste into your clients
-lllm setup --no-api-key   # back to keyless
+lllm key                  # print the key, to paste into your clients
+lllm setup --api-key      # require a key on any build
+lllm setup --no-api-key   # keyless even on an older build (setup remembers the choice and warns)
 ```
 
 The key lives in `~/.config/local-llm/api-key` (readable only by you). The panel and the `lllm` command use it automatically; give other clients the key along with `http://127.0.0.1:8080/v1`. With a key set, a web page can't load, unload, or query models on any llama.cpp version. `/health` stays open, as llama.cpp always allows it.

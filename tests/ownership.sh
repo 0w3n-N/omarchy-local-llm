@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tests for what `lllm setup` and `lllm uninstall` may touch.
+# Tests for what `lllm setup` and `lllm uninstall` may touch, and for when setup
+# requires an API key.
 #
 # Everything runs in a throwaway $HOME under a temp directory, with stubs for
 # systemctl, llama-server and curl, so nothing on the real machine is read or
@@ -16,19 +17,42 @@ FAKE_PID=
 cleanup() { [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-# Stubs. systemctl only logs its arguments.
+# Stubs. systemctl only logs its arguments; keys.log also notes whether a key was set
+# at that moment (key=y/n), to show what the server would have started with.
 STUBS=$WORK/stubs; mkdir -p "$STUBS"
-printf '#!/bin/sh\necho "systemctl $*" >> "$HOME/systemctl.log"\nexit 0\n' > "$STUBS/systemctl"
+cat > "$STUBS/systemctl" <<'SH'
+#!/bin/sh
+echo "systemctl $*" >> "$HOME/systemctl.log"
+if [ -e "$XDG_CONFIG_HOME/local-llm/api-key" ]; then k=y; else k=n; fi
+echo "$* key=$k" >> "$HOME/keys.log"
+exit 0
+SH
 printf '#!/bin/sh\nexit 0\n' > "$STUBS/llama-server"
 printf '#!/bin/sh\nexit 0\n' > "$STUBS/curl"
 chmod +x "$STUBS"/*
 
-# A server that answers 403 to everything, so setup's "does the server refuse other
-# websites?" probe returns at once instead of waiting for a server that isn't there.
-python3 - "$WORK/port" <<'PY' &
-import http.server, sys
+# A fake llama-server, so setup's "does the server refuse other websites?" probe
+# answers at once. $WORK/mode picks the build it plays:
+#   new  (default) b12340+: 403 to everything, like a request from another website
+#   old  older build: ignores Origin; 401 without the key once one is set, else 200
+#   down a server that isn't answering properly (503)
+python3 - "$WORK/port" "$WORK" <<'PY' &
+import http.server, os, sys
+work = sys.argv[2]
+def read(path):
+    try: return open(path).read().strip()
+    except OSError: return ""
 class H(http.server.BaseHTTPRequestHandler):
-    def do_GET(self): self.send_error(403)
+    def do_GET(self):
+        mode = read(os.path.join(work, "mode")) or "new"
+        if mode == "new": return self.send_error(403)
+        if mode == "down": return self.send_error(503)
+        key = read(os.path.join(read(os.path.join(work, "confdir")), "api-key"))
+        if key and self.headers.get("Authorization") != f"Bearer {key}":
+            return self.send_error(401)
+        body = b'{"data": []}'
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers()
+        self.wfile.write(body)
     do_POST = do_GET
     def log_message(self, *a): pass
 srv = http.server.HTTPServer(("127.0.0.1", 0), H)
@@ -49,7 +73,10 @@ fresh() {
   export LLM_SERVER=http://127.0.0.1:$(cat "$WORK/port") PATH=$STUBS:$PATH
   U=$XDG_CONFIG_HOME/systemd/user; C=$XDG_CONFIG_HOME/local-llm
   R=$XDG_STATE_HOME/local-llm/setup-units.json; SVC=local-llm.service
+  K=$XDG_STATE_HOME/local-llm/keyless
+  echo "$C" > "$WORK/confdir"; echo new > "$WORK/mode"
 }
+build() { echo "$1" > "$WORK/mode"; }
 run() { timeout 60 python3 "$LLLM" "$@" </dev/null 2>&1; }
 # Run with a terminal on stdin and feed it answers: `ask "<args>" $'y\nn\n'`.
 ask() { timeout 60 script -qec "python3 '$LLLM' $1" /dev/null <<< "$2" 2>&1 | tr -d '\r'; }
@@ -194,6 +221,64 @@ sed -i "s|^ExecStart=[^ ]*llama-server|ExecStart=$WORK/mine/llama-server|" "$U/$
 PATH=$WORK/mine:$PATH run uninstall -y >/dev/null
 ck "the unit is kept" '[ -e "$U/$SVC" ]'
 ck "it was never disabled" '! grep disable "$HOME/systemctl.log" | grep -qF local-llm.service'
+
+echo "O. older llama.cpp, fresh setup: the key is on, and was on before the server started"
+fresh O; build old
+out=$(run setup)
+ck "a key is set" '[ -s "$C/api-key" ] && [ -s "$C/api-key.header" ]'
+ck "server.env points the server at it" 'grep -q "^LLAMA_ARG_API_KEY_FILE=$C/api-key$" "$C/server.env"'
+ck "the server was first started with the key" 'grep -q "^--user enable --now local-llm.service local-llm-reload.path key=y$" "$HOME/keys.log"'
+ck "it never ran without it" '! grep -q "local-llm.service.* key=n$" "$HOME/keys.log"'
+ck "setup says why" 'grep -q "lllm turned the API key on" <<<"$out"'
+ck "no keyless choice is recorded" '[ ! -e "$K" ]'
+
+echo "P. llama.cpp that refuses other websites, fresh setup: keyless, after testing with the key on"
+fresh P; mkdir -p "$C"; printf 'X=1\n' > "$C/server.env"
+out=$(run setup)
+ck "no key is left" '[ ! -e "$C/api-key" ] && [ ! -e "$C/api-key.header" ]'
+ck "the user's server.env is as it was" '[ "$(cat "$C/server.env")" = "X=1" ]'
+ck "the server started with the key, then restarted without it" 'grep -q "^--user enable --now .* key=y$" "$HOME/keys.log" && [ "$(tail -n1 "$HOME/keys.log")" = "--user restart local-llm.service key=n" ]'
+ck "setup says no key is needed" 'grep -q "api key  not needed" <<<"$out"'
+ck "and doesn't warn" '! grep -q "^warning:" <<<"$out"'
+
+echo "Q. re-running setup on a keyless server that refuses other websites changes nothing"
+fresh Q; run setup >/dev/null; : > "$HOME/keys.log"
+run setup >/dev/null
+ck "no key was created, not even briefly" '! grep -q "key=y" "$HOME/keys.log"'
+ck "the server wasn't restarted" '! grep -q restart "$HOME/keys.log"'
+
+echo "R. keyless install from an earlier version on an older build: re-running setup turns the key on"
+fresh R; run setup >/dev/null; build old; : > "$HOME/keys.log"
+out=$(run setup)
+ck "a key is set" '[ -s "$C/api-key" ]'
+ck "the server was restarted with it" 'grep -q "^--user restart local-llm.service key=y$" "$HOME/keys.log"'
+ck "setup says why" 'grep -q "lllm turned the API key on" <<<"$out"'
+
+echo "S. --no-api-key on an older build: keyless, remembered, with a warning"
+fresh S; build old
+out=$(run setup --no-api-key)
+ck "no key" '[ ! -e "$C/api-key" ]'
+ck "the choice is recorded" '[ -e "$K" ]'
+ck "it warns about other websites" 'grep -q "^warning: this llama.cpp doesn.t enforce" <<<"$out"'
+: > "$HOME/keys.log"; out=$(run setup)
+ck "a plain setup afterwards keeps it keyless" '[ ! -e "$C/api-key" ] && ! grep -q "key=y" "$HOME/keys.log"'
+ck "and still warns" 'grep -q "^warning: this llama.cpp doesn.t enforce" <<<"$out"'
+run setup --api-key >/dev/null
+ck "--api-key clears the choice" '[ ! -e "$K" ] && [ -s "$C/api-key" ]'
+run setup --no-api-key >/dev/null; run uninstall -y >/dev/null
+ck "uninstall removes the choice" '[ ! -e "$K" ] && [ ! -e "$XDG_STATE_HOME/local-llm" ]'
+
+echo "T. server not answering the test: the key stays on"
+fresh T; build down
+out=$(run setup)
+ck "a key is set" '[ -s "$C/api-key" ]'
+ck "setup says it couldn't check" 'grep -q "Couldn.t check whether" <<<"$out"'
+
+echo "U. a key the user set stays, on any build"
+fresh U; run setup --api-key >/dev/null; key=$(cat "$C/api-key"); : > "$HOME/keys.log"
+run setup >/dev/null
+ck "same key after a plain setup" '[ "$(cat "$C/api-key")" = "$key" ]'
+ck "no restart" '! grep -q restart "$HOME/keys.log"'
 
 echo
 if [ $fail = 0 ]; then echo "ALL PASS"; else echo "SOME FAILED"; fi

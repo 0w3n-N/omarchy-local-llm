@@ -40,6 +40,9 @@ UNIT_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "s
 # unit the user kept during setup or edited since.
 SETUP_RECORD = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "local-llm/setup-units.json"
 ENV_KEY_VAR = "LLAMA_ARG_API_KEY_FILE"   # the one line of ENV_FILE that lllm manages
+# Present after `lllm setup --no-api-key`: the user chose keyless even if their llama.cpp
+# doesn't refuse other websites. Without it, setup turns the key on for such a build.
+KEYLESS_CHOICE = SETUP_RECORD.parent / "keyless"
 BIN_LINK = Path.home() / ".local/bin/lllm"
 SELF = Path(__file__).resolve()
 CTX_HEADROOM_GB = 2.5  # VRAM kept free for KV cache + compute buffers
@@ -1245,13 +1248,35 @@ def cross_origin_blocked(wait=0):
     return None
 
 
+def refuses_other_websites(wait=0):
+    """Does the server refuse a request from another website, even one that has the key?
+
+    A build that enforces --cors-origins answers 403 to a foreign Origin even with a
+    valid key; an older one answers 200. Lets setup test the build while the key
+    already protects it. None = not reachable, or the key wasn't accepted.
+    """
+    import time
+    for _ in range(max(1, wait)):
+        req = urllib.request.Request(SERVER + "/models", headers={"Origin": "https://example.invalid"})
+        if api_key():
+            req.add_header("Authorization", f"Bearer {api_key()}")
+        try:
+            urllib.request.urlopen(req, timeout=5).close()
+            return False
+        except urllib.error.HTTPError as e:
+            return True if e.code == 403 else None
+        except OSError:
+            time.sleep(1)
+    return None
+
+
 def warn_if_cross_origin_open(wait=0):
     if cross_origin_blocked(wait) is False:
         print(
             "\nwarning: this llama.cpp doesn't enforce --cors-origins (needs build b12340 or newer).\n"
             "  A website open in your browser could still send requests that load or unload\n"
             "  models (it can't read the replies). Update llama.cpp to b12340+, or require an\n"
-            "  API key now:  lllm setup --api-key"
+            "  API key:  lllm setup --api-key"
         )
 
 
@@ -1441,12 +1466,19 @@ def cmd_setup(args):
     key_before = api_key()
     if "--api-key" in args:
         enable_api_key()
+        KEYLESS_CHOICE.unlink(missing_ok=True)
     elif "--no-api-key" in args:
         disable_api_key()
-    key_changed = api_key() != key_before
+        KEYLESS_CHOICE.parent.mkdir(parents=True, exist_ok=True)
+        KEYLESS_CHOICE.write_text("set by `lllm setup --no-api-key`; `lllm setup --api-key` removes it\n")
     record = load_setup_record() or {}
+    units_changed = False
     for name, body in UNIT_FILES.items():
         text = render_unit(name, llama_server, curl)
+        try:
+            units_changed |= (UNIT_DIR / name).read_text() != text
+        except OSError:
+            units_changed = True
         if write_if_wanted(UNIT_DIR / name, text):
             record[name] = _sha256(text)
         else:
@@ -1471,16 +1503,42 @@ def cmd_setup(args):
     install_completion()
 
     systemctl("daemon-reload")
+    # Keyless only where the server itself refuses other websites (llama.cpp b12340+).
+    # Version strings can't tell (source builds report "build 1"), so the server is
+    # tested, with the key already on: older builds never run keyless, not even briefly.
+    testing_key = False
+    if not api_key() and not KEYLESS_CHOICE.exists():
+        # Already running keyless from the same units and refusing other websites: keep it.
+        if units_changed or refuses_other_websites() is not True:
+            enable_api_key(quiet=True)
+            testing_key = True
+    key_changed = api_key() != key_before
     rc = systemctl("enable", "--now", UNIT, RELOAD_PATH_UNIT)
     if rc == 0 and key_changed:
         rc = systemctl("restart", UNIT)   # the key is read at startup
     if rc != 0:
         die(f"couldn't start {UNIT} — see: lllm logs", rc)
+    if testing_key:
+        refused = refuses_other_websites(wait=15)
+        if refused:
+            disable_api_key(quiet=True)
+            rc = systemctl("restart", UNIT)
+            if rc != 0:
+                die(f"couldn't restart {UNIT} — see: lllm logs", rc)
+            print("  api key  not needed — this llama.cpp refuses requests from other websites itself")
+        elif refused is False:
+            print("\nThis llama.cpp doesn't refuse requests from other websites (that needs build b12340\n"
+                  "or newer), so a web page could load or unload models. lllm turned the API key on.\n"
+                  "To go keyless anyway: lllm setup --no-api-key")
+        else:
+            print("\nCouldn't check whether this llama.cpp refuses requests from other websites (server\n"
+                  "not answering), so the API key stays on. Run `lllm setup` again once it's up.")
     if api_key():
         print("\nAPI key required: give clients the key from `lllm key` (the panel and lllm use it automatically).")
     print(f"\nllama-server is running at {SERVER} (OpenAI API: {SERVER}/v1) and starts at login.")
     print("Next: lllm pull   (search Hugging Face and download a model)")
-    warn_if_cross_origin_open(wait=15)
+    if not testing_key:
+        warn_if_cross_origin_open(wait=15)
 
 
 def write_private(path, text):
@@ -1491,7 +1549,7 @@ def write_private(path, text):
     os.chmod(path, 0o600)
 
 
-def enable_api_key():
+def enable_api_key(quiet=False):
     import secrets
     rest = env_lines_without_key()   # before writing anything: dies if server.env can't be read
     if ENV_FILE.exists() and not os.access(ENV_FILE, os.W_OK):
@@ -1503,7 +1561,8 @@ def enable_api_key():
     if rest and not rest[-1].endswith("\n"):
         rest[-1] += "\n"
     write_private(ENV_FILE, "".join(rest) + f"{ENV_KEY_VAR}={KEY_FILE}\n")
-    print(f"  api key  required — stored in {KEY_FILE} (show it with: lllm key)")
+    if not quiet:
+        print(f"  api key  required — stored in {KEY_FILE} (show it with: lllm key)")
 
 
 def env_lines_without_key():
@@ -1519,7 +1578,7 @@ def env_lines_without_key():
     return [l for l in lines if l.split("=", 1)[0].strip() != ENV_KEY_VAR]
 
 
-def disable_api_key():
+def disable_api_key(quiet=False):
     removed = False
     if ENV_FILE.exists():
         rest = env_lines_without_key()   # unreadable: dies before anything is deleted
@@ -1534,7 +1593,7 @@ def disable_api_key():
         if f.exists():
             f.unlink()
             removed = True
-    if removed:
+    if removed and not quiet:
         print("  api key  removed — the server accepts local requests without one")
 
 
@@ -1586,6 +1645,7 @@ def cmd_uninstall(args):
         print(f"  removed  {UNIT_DIR / name}")
     for name, why in theirs:
         print(f"  kept     {UNIT_DIR / name} ({why})")
+    KEYLESS_CHOICE.unlink(missing_ok=True)
     save_setup_record({})
     systemctl("daemon-reload")
     if BIN_LINK.is_symlink() and BIN_LINK.resolve() == SELF:
