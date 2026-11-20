@@ -39,7 +39,7 @@ omarchy plugin add https://github.com/0w3n-N/omarchy-local-llm.git --enable
 Then open the panel and flip the switch. The first time, this runs **setup** in a terminal. Setup:
 
 1. checks that `llama-server` and `curl` are installed, and tells you what to install if not;
-2. writes three systemd **user** units to `~/.config/systemd/user/`: `local-llm.service` (the server), and `local-llm-reload.path` / `.service` (rescan when models or presets change);
+2. writes three systemd **user** units to `~/.config/systemd/user/`: `local-llm.service` (the server), and `local-llm-reload.path` / `.service` (rescan when models or presets change), and records a checksum of each in `~/.local/state/local-llm/setup-units.json` so that uninstall removes only what setup wrote;
 3. creates `~/.config/local-llm/presets.ini` if it doesn't exist;
 4. links `~/.local/bin/lllm` to the bundled command-line tool, if nothing is there already;
 5. enables and starts the service.
@@ -125,7 +125,7 @@ The widget's own settings are the server port (default 8080) and how often it ch
 Plugins run unsandboxed inside the Omarchy shell, so here is everything this one executes:
 
 - `curl` to `127.0.0.1` only (model list, load, unload); with an API key set, curl reads the header from `~/.config/local-llm/api-key.header` (`-H @file`), so the key never appears in a process list
-- `systemctl --user` to start, stop, and inspect `local-llm.service`
+- `systemctl --user` to start, stop, and inspect `local-llm.service`; `lllm setup` and `lllm uninstall` also enable and disable the units they own
 - `nvidia-smi` and `cat /proc/<pid>/stat` for the VRAM gauge and the "generating" state, only while a model is loaded
 - the bundled `bin/lllm` in a terminal, when you press a button that needs it (the sandbox button runs `lllm sandbox shell`, which runs setup with `sudo` first if needed)
 
@@ -135,11 +135,11 @@ It makes no network requests of its own. `lllm search` and `lllm pull` talk to h
 
 ```sh
 lllm sandbox remove           # deletes the sandbox container and image (keeps ~/Sandbox)
-lllm uninstall                # stops the service, removes the three units and the lllm link
+lllm uninstall                # stops the service, removes the units setup wrote and the lllm link
 omarchy plugin remove io.github.0w3n-n.local-llm
 ```
 
-Run `lllm uninstall` first, since it lives inside the plugin folder. It keeps your downloaded models (`~/.cache/llmfit/models`) and your settings (`~/.config/local-llm`). Delete those two folders by hand if you want them gone.
+Run `lllm uninstall` first, since it lives inside the plugin folder. It removes a systemd unit only if `lllm setup` wrote it and it is unchanged since (setup records a checksum in `~/.local/state/local-llm/setup-units.json`). A unit you kept during setup, or edited afterwards, is left in place and still running, and uninstall tells you which. It keeps your downloaded models (`~/.cache/llmfit/models`) and your settings (`~/.config/local-llm`). Delete those two folders by hand if you want them gone.
 
 ## Troubleshooting
 
