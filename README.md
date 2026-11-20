@@ -152,6 +152,10 @@ Run `lllm uninstall` first, since it lives inside the plugin folder. It removes 
 - **Sandbox says "log out and back in"**: setup added you to the docker group but this login doesn't have it yet. Run `lllm sandbox setup` again to bridge the session, or log out and back in.
 - **Something in the sandbox is broken**: `lllm sandbox reset` gives you a fresh container. Your files in `~/Sandbox` are kept.
 
+## Tests
+
+`tests/ownership.sh` checks that `lllm setup` and `lllm uninstall` only remove or change what setup wrote (systemd units you kept or edited, and other settings in `server.env`). It runs in a throwaway home directory with stubs for `systemctl`, `llama-server` and `curl`, so it never touches your real setup or starts a service. It takes a few seconds and needs `bash`, `python3` and `script`.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
